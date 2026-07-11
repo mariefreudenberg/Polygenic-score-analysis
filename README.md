@@ -92,6 +92,3 @@ Implementation of component-wise boosting using individual-level genotype data.
 Repository: https://github.com/biometrische-gesellschaft/snpboost
 
 Unlike the other methods, snpboost does **not** rely on GWAS summary statistics but instead trains directly on genotype and phenotype data from the LIFE-Adult cohort.
-
-
-> Year.
