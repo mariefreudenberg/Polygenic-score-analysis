@@ -1,13 +1,39 @@
 # Polygenic Risk Score Construction and Evaluation Across Ancestries
 
+# Polygenic Risk Score Transferability and Recalibration
+
+<p align="center">
+  <img src="figures/graphical_overview.png" width="900">
+</p>
+
 ## Overview
 
-This repository contains the R scripts and analysis notebooks used for my master's thesis investigating the construction, evaluation, and transferability of polygenic risk scores (PRS) across diverse ancestry groups.
+This repository contains the analysis scripts used for my Master's thesis investigating the construction, evaluation, transferability, and recalibration of polygenic risk scores (PRS) across diverse ancestry groups.
 
-The project compares several commonly used PRS construction methods using publicly available GWAS summary statistics, evaluates published PRS from the PGS Catalog, and investigates ancestry-related differences using the 1000 Genomes Project and the LIFE-Adult cohort.
+The project combines analyses of published polygenic scores from the PGS Catalog with the development of recalibrated PRS models using several widely used methods. Performance was evaluated in the LIFE-Adult cohort, while ancestry-dependent score distributions and genetic differentiation were investigated using the 1000 Genomes Project.
 
-The repository contains only scripts and documentation. Large datasets, genotype files, summary statistics, and intermediate results are intentionally excluded.
+The complete study workflow is summarized in the figure above and consists of four main components:
 
+1. **Study design and datasets**
+   - Published PRS were evaluated in the LIFE-Adult cohort for BMI, height, and type 2 diabetes.
+   - Population-level analyses were performed using the 1000 Genomes Project reference populations.
+
+2. **Population differentiation and transferability**
+   - Pairwise Hudson's \(F_{ST}\) was calculated between populations and superpopulations.
+   - Published PRS distributions were compared across ancestry groups.
+   - Genetic differentiation was related to differences in PRS distributions.
+
+3. **Evaluation of published PRS**
+   - Published scores from the PGS Catalog were applied to the LIFE-Adult cohort.
+   - Predictive performance was assessed using linear or logistic regression, depending on the phenotype.
+
+4. **PRS recalibration**
+   - Published scores were compared with recalibrated models generated using **PRSice**, **LDpred2**, **PRS-CS**, **lassosum**, and **snpboost**.
+   - The influence of GWAS sample size, recalibration method, and training cohort size on prediction performance was evaluated.
+
+The repository contains only analysis scripts and documentation. Large genotype datasets, GWAS summary statistics, intermediate files, and other external resources are intentionally excluded because of their size and licensing restrictions.
+
+Each analysis directory contains an R Markdown notebook describing the required inputs and reproducing the corresponding analysis.
 ---
 
 # Datasets
