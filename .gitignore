@@ -1,7 +1,6 @@
 # Data
 data/
 results/
-figures/
 
 # Large data files
 *.csv

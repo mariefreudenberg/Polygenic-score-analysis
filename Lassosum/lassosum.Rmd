@@ -1,165 +1,270 @@
 ---
-title: "Untitled"
+title: "lassosum"
 output: html_document
-date: "2025-05-14"
+date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
 ```
 
-# following https://github.com/tshmak/lassosum?tab=readme-ov-file
+# Overview
 
-# install.packages("/path/to/downloaded_binary_file", repos=NULL)
-# install.packages("R:/Doktoranden/MarieFreudenberg/analysen/Lassosum/lassosum_0.4.5.zip", repos=NULL)
+This notebook constructs a polygenic score with `lassosum`, performs
+split-validation to select the tuning parameters, and evaluates the resulting
+score using linear or logistic regression.
 
-# load libraries and define base path 
+The workflow follows the official lassosum repository:
+
+<https://github.com/tshmak/lassosum>
+
+# Required input
+
+## GWAS summary statistics
+
+A tab-separated file containing:
+
+- `chr`: chromosome
+- `pos`: base-pair position in hg38
+- `a1`: effect allele
+- `a0`: other allele
+- `beta`: effect estimate
+- `p`: association p-value
+- `N`: GWAS sample size
+
+## Genotype data
+
+A PLINK BED dataset with one shared prefix:
+
+```text
+genotype_prefix.bed
+genotype_prefix.bim
+genotype_prefix.fam
+```
+
+The same dataset is used here as both the LD reference and test dataset, as in
+the original workflow.
+
+## Phenotype and covariate file
+
+A tab-separated file containing:
+
+```text
+IID
+Phenotype
+Age
+Sex
+PC1-10
+```
+
+## Software
+
+The `lassosum` R package and its dependencies are required.
+
+# Load libraries
+
 ```{r}
-.libPaths("H:/Rlibs")
 library(RcppArmadillo)
 library(Matrix)
 library(data.table)
 library(lassosum)
 library(readr)
 library(glue)
-library(readxl)
 library(dplyr)
 library(pROC)
 library(DescTools)
-
-base_path <- "R:/Doktoranden/MarieFreudenberg/analysen/Lassosum/"
 ```
 
-# Read summary statistics file (need positions on hg38)
+# Set paths and analysis options
+
+Change only the settings in this section.
+
 ```{r}
+# Main project directory
+path_prefix <- "path/to/project"
+
 trait <- "Diabetes"
-trait_type  <- "binary"   # "continuous" or "binary"
+trait_type <- "binary"  # "continuous" or "binary"
 study <- "Mahajan.NatGenet2018b.T2D.European"
-ss <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/sumstats/{study}.tsv")))
-head(ss)
-nrow(ss)
+
+# GWAS summary statistics
+sumstats_file <- file.path(
+  path_prefix,
+  "sumstats",
+  paste0(study, ".tsv")
+)
+
+# PLINK BED prefix without .bed, .bim, or .fam
+genotype_prefix <- file.path(
+  path_prefix,
+  "path",
+  "to",
+  "genotype_data"
+)
+
+# Phenotype and covariate file
+phenotype_file <- file.path(
+  path_prefix,
+  "Phenofiles",
+  paste0(trait, "_covars.tsv")
+)
+
+# Output directory
+output_dir <- file.path(
+  path_prefix,
+  "Lassosum",
+  trait
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# LD block definition supplied by lassosum
+LDblocks <- "EUR.hg38"
 ```
 
-# save sumstats as .tsv with correct column names needed for lassosum 
+# Read and prepare summary statistics
+
 ```{r}
-ss <- ss %>%
+ss <- fread(
+  sumstats_file
+) %>%
   transmute(
     chr = chr,
     pos = pos,
-    a1  = a1,
-    a0  = a0,
+    a1 = a1,
+    a0 = a0,
     beta = beta,
-    p    = p,
-    N    = N
+    p = p,
+    N = N
   )
-fwrite(ss, file = file.path(glue(base_path, "{trait}/{study}_lassosum.tsv")))
-```
-# Specify the PLINK file stub of the reference panel
-```{r}
-ref.bfile <- file.path(base_path, "LIFE_bed")
-```
-# Specify the PLINK file stub of the test data (use same entire LIFE data for both LD reference and testing)
-```{r}
-test.bfile <- file.path(base_path, "LIFE_bed")
-```
-# Read LD region file
-```{r}
-LDblocks <- "EUR.hg38" 
-```
-# some p values are 0 or 1 which will be a problem later, increase/decrease the values a tiiny bit
-```{r}
-ss <- fread(file.path(glue(base_path, "{trait}/{study}_lassosum.tsv")))
-ss$p    <- as.numeric(ss$p)
-ss$N    <- as.numeric(ss$N)
+
+ss$p <- as.numeric(ss$p)
+ss$N <- as.numeric(ss$N)
 ss$beta <- as.numeric(ss$beta)
 
-sum(is.na(ss$p))
-sum(is.na(ss$N))
-sum(is.na(ss$beta))
-
-table(ss$p == 0, useNA = "ifany")
-table(ss$p == 1, useNA = "ifany")
-
-eps <- 1e-300  # some tiny number
+# Replace exact p-values of 0 or 1
+eps <- 1e-300
 
 ss$p[ss$p <= 0] <- eps
 ss$p[ss$p >= 1] <- 1 - eps
 ```
 
-# To run lassosum, we need to input SNP-wise correlations with the phenotype. This can be converted from p-values via the p2cor function.
+# Convert p-values to SNP–phenotype correlations
+
 ```{r}
-cor <- p2cor(p = ss$p, n = ss$N, sign = sign(ss$beta))
-```
-# if there is a warning that some n are too small, drop those SNP
-```{r}
+cor <- p2cor(
+  p = ss$p,
+  n = ss$N,
+  sign = sign(ss$beta)
+)
+
+# Remove variants for which the correlation could not be calculated
 keep <- !is.na(cor)
-cor2 <- cor[keep]
-ss  <- ss[keep, ]
+
+cor <- cor[keep]
+ss <- ss[keep, ]
 ```
 
-# Running lassosum using standard pipeline (change to cor2 if cor function had warning)
+# Run lassosum
+
 ```{r}
-out <- lassosum.pipeline(cor=cor2, chr=ss$chr, pos=ss$pos, 
-                         A1=ss$a1, A2=ss$a0, # A2 is not required but advised
-                         ref.bfile=ref.bfile, test.bfile=test.bfile, 
-                         LDblocks = LDblocks)
-```
-```{r}
-saveRDS(out, file = file.path(glue(base_path, "{trait}/{study}_out.rds")))
-```
-```{r}
-out <- readRDS(file.path(glue(base_path, "{trait}/{study}_out.rds")))
+out <- lassosum.pipeline(
+  cor = cor,
+  chr = ss$chr,
+  pos = ss$pos,
+  A1 = ss$a1,
+  A2 = ss$a0,
+  ref.bfile = genotype_prefix,
+  test.bfile = genotype_prefix,
+  LDblocks = LDblocks
+)
 ```
 
-### Validation with phenotype ### 
-# Read in pheno and covar files, if they don' exist yet they need to be created using the next code chunk
 ```{r}
-pheno <- fread(file = file.path(glue(base_path, "{trait}/phenodata.tsv")))
-covar <- fread(file = file.path(glue(base_path, "{trait}/covardata.tsv")))
-```
-```{r}
-pheno_covars_file <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/Phenofiles/{trait}_covars.tsv")))
+lassosum_output_file <- file.path(
+  output_dir,
+  paste0(study, "_lassosum_out.rds")
+)
 
-# create pheno file
-pheno_file <- pheno_covars_file[, .(
+saveRDS(
+  out,
+  lassosum_output_file
+)
+```
+
+# Prepare phenotype and covariate input
+
+`splitvalidate()` expects separate phenotype and covariate tables containing
+both `FID` and `IID`.
+
+```{r}
+pheno_covars <- fread(
+  phenotype_file
+)
+
+pheno <- pheno_covars[, .(
   FID = IID,
   IID = IID,
   Phenotype = Phenotype
 )]
 
-# create covariate file
-cov_file <- pheno_covars_file[, .(
+covar <- pheno_covars[, .(
   FID = IID,
   IID = IID,
   Sex = Sex,
   Age = Age,
-  PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10
+  PC1,
+  PC2,
+  PC3,
+  PC4,
+  PC5,
+  PC6,
+  PC7,
+  PC8,
+  PC9,
+  PC10
 )]
-
-# save as tab-separated files
-fwrite(pheno_file, file = file.path(base_path, trait, "phenodata.tsv"), sep = "\t")
-fwrite(cov_file, file = file.path(base_path, trait, "covardata.tsv"), sep = "\t")
-
-pheno <- fread(file = file.path(glue(base_path, "{trait}/phenodata.tsv")))
-covar <- fread(file = file.path(glue(base_path, "{trait}/covardata.tsv")))
 ```
 
-# Split-validation to avoid overfitting (one half for validation, other half for PGS calculation (PGS in the two halves are then standardised and stacked back together. This avoids overfitting due to the overlapping of the target and the validation dataset.))
+# Split-validation
+
+Split-validation selects the lassosum tuning parameters while reducing
+overfitting when the same target dataset is used for model validation and score
+evaluation.
 
 ```{r}
-sv <- splitvalidate(out, pheno=pheno, covar=covar)
+sv <- splitvalidate(
+  out,
+  pheno = pheno,
+  covar = covar
+)
 ```
-# run linear or logistic regression analysis
+
+# Create the PRS table
+
 ```{r}
-outcome_var <- "Phenotype"
-prs_var     <- "PRS"   # we will create this column from sv$best.pgs
-covars      <- c("Age", "Sex", paste0("PC", 1:10))
-
-
-# 1) PRS table from sv$best.pgs (names are "FID_IID")
 pgs_vec <- sv$best.pgs
-id_mat  <- do.call(rbind, strsplit(names(pgs_vec), "_"))
-colnames(id_mat) <- c("FID", "IID")
+
+id_mat <- do.call(
+  rbind,
+  strsplit(
+    names(pgs_vec),
+    "_"
+  )
+)
+
+colnames(id_mat) <- c(
+  "FID",
+  "IID"
+)
 
 prs_df <- data.frame(
   FID = id_mat[, "FID"],
@@ -167,51 +272,114 @@ prs_df <- data.frame(
   PRS = as.numeric(pgs_vec),
   row.names = NULL
 )
+```
 
-# 2) Merge PRS with phenotype + covariates (assumes your pheno/covar have IID; add FID join if you have it)
+# Merge PRS, phenotype, and covariates
+
+```{r}
+covariates <- c(
+  "Age",
+  "Sex",
+  paste0("PC", 1:10)
+)
+
 analysis_data <- prs_df %>%
-  left_join(pheno, by = "IID") %>%     # expects pheno has IID and Phenotype
-  left_join(covar, by = "IID") %>%     # expects covar has IID and Age/Sex/PCs
-  select(all_of(c("FID", "IID", outcome_var, prs_var, covars))) %>%
-  as.data.frame()
+  left_join(
+    pheno,
+    by = c(
+      "FID",
+      "IID"
+    )
+  ) %>%
+  left_join(
+    covar,
+    by = c(
+      "FID",
+      "IID"
+    )
+  ) %>%
+  select(
+    FID,
+    IID,
+    Phenotype,
+    PRS,
+    all_of(covariates)
+  ) %>%
+  filter(
+    complete.cases(.)
+  ) %>%
+  mutate(
+    Age = as.numeric(Age),
+    Sex = as.factor(Sex),
+    PRS_SD = as.numeric(
+      scale(PRS)
+    )
+  )
+```
 
-# 3) Keep complete cases for all model variables
-analysis_data <- analysis_data[complete.cases(analysis_data), ]
+# Define regression models
 
-# 4) Ensure types
-analysis_data$Age <- as.numeric(analysis_data$Age)
-analysis_data$Sex <- as.factor(analysis_data$Sex)
-
-# 5) Standardize PRS to PRS_SD (per SD effect)
-analysis_data$PRS_SD <- as.numeric(scale(analysis_data[[prs_var]]))
-
-# =========================
-# Formulas (same as CS script)
-# =========================
+```{r}
 base_formula <- as.formula(
-  paste(outcome_var, "~", paste(covars, collapse = " + "))
-)
-full_formula <- as.formula(
-  paste(outcome_var, "~", paste(c("PRS_SD", covars), collapse = " + "))
+  paste(
+    "Phenotype ~",
+    paste(
+      covariates,
+      collapse = " + "
+    )
+  )
 )
 
-# =========================
-# Run models depending on trait type
-# =========================
+full_formula <- as.formula(
+  paste(
+    "Phenotype ~",
+    paste(
+      c(
+        "PRS_SD",
+        covariates
+      ),
+      collapse = " + "
+    )
+  )
+)
+```
+
+# Evaluate continuous traits
+
+```{r}
 if (trait_type == "continuous") {
 
-  # Linear regression
-  model_reduced <- lm(base_formula, data = analysis_data)
-  model_full    <- lm(full_formula, data = analysis_data)
+  model_reduced <- lm(
+    base_formula,
+    data = analysis_data
+  )
 
-  r2_base <- summary(model_reduced)$r.squared
-  r2_full <- summary(model_full)$r.squared
-  r2_prs  <- r2_full - r2_base
+  model_full <- lm(
+    full_formula,
+    data = analysis_data
+  )
 
-  prs_row <- coef(summary(model_full))["PRS_SD", ]
-  prs_ci  <- confint(model_full, "PRS_SD")
+  r2_base <- summary(
+    model_reduced
+  )$r.squared
 
-  var_explained_txt <- glue("
+  r2_full <- summary(
+    model_full
+  )$r.squared
+
+  r2_prs <- r2_full - r2_base
+
+  prs_row <- coef(
+    summary(model_full)
+  )["PRS_SD", ]
+
+  prs_ci <- confint(
+    model_full,
+    "PRS_SD"
+  )
+
+  results_text <- glue(
+    "
 Base model R²:                {round(r2_base, 4)}
 Full model R²:                {round(r2_full, 4)}
 Incremental R² (PRS):         {round(r2_prs, 4)}
@@ -220,120 +388,207 @@ PRS effect per SD:
   Beta:                       {round(unname(prs_row['Estimate']), 4)}
   95% CI:                     [{round(prs_ci[1], 4)}, {round(prs_ci[2], 4)}]
   P-value:                    {signif(unname(prs_row['Pr(>|t|)']), 4)}
-")
-
-  cat(var_explained_txt, "\n")
-  print(summary(model_full))
-
-  results <- list(
-    trait_type   = trait_type,
-    n            = nrow(analysis_data),
-    base_model   = model_reduced,
-    full_model   = model_full,
-    r2_base      = r2_base,
-    r2_full      = r2_full,
-    r2_prs       = r2_prs,
-    beta_per_sd  = unname(prs_row["Estimate"]),
-    beta_ci_low  = prs_ci[1],
-    beta_ci_high = prs_ci[2],
-    p_value      = unname(prs_row["Pr(>|t|)"])
+"
   )
 
-} else if (trait_type == "binary") {
+  cat(
+    results_text,
+    "\n"
+  )
 
-  # Make sure the outcome is binary
-  y <- analysis_data[[outcome_var]]
+  print(
+    summary(model_full)
+  )
+}
+```
 
-  if (is.factor(y) || is.character(y)) {
-    analysis_data[[outcome_var]] <- droplevels(as.factor(y))
-    if (nlevels(analysis_data[[outcome_var]]) != 2) {
-      stop("For trait_type = 'binary', the phenotype must have exactly 2 levels.")
+# Evaluate binary traits
+
+```{r}
+if (trait_type == "binary") {
+
+  y <- analysis_data$Phenotype
+
+  if (
+    is.factor(y) ||
+      is.character(y)
+  ) {
+
+    analysis_data$Phenotype <-
+      droplevels(
+        as.factor(y)
+      )
+
+    if (
+      nlevels(
+        analysis_data$Phenotype
+      ) != 2
+    ) {
+      stop(
+        "For trait_type = 'binary', Phenotype must have exactly two levels."
+      )
     }
+
   } else {
-    uniq_y <- sort(unique(y))
-    if (length(uniq_y) != 2) {
-      stop("For trait_type = 'binary', the phenotype must have exactly 2 values.")
+
+    unique_y <- sort(
+      unique(y)
+    )
+
+    if (
+      length(unique_y) != 2
+    ) {
+      stop(
+        "For trait_type = 'binary', Phenotype must have exactly two values."
+      )
     }
-    # Recode numeric/logical outcomes to 0/1 using the higher value as the event
-    analysis_data[[outcome_var]] <- ifelse(y == uniq_y[2], 1, 0)
+
+    analysis_data$Phenotype <-
+      ifelse(
+        y == unique_y[2],
+        1,
+        0
+      )
   }
 
-  # Logistic regression
-  model_reduced <- glm(base_formula, data = analysis_data, family = binomial())
-  model_full    <- glm(full_formula, data = analysis_data, family = binomial())
+  model_reduced <- glm(
+    base_formula,
+    data = analysis_data,
+    family = binomial()
+  )
 
-  # Predicted probabilities
-  prob_base <- predict(model_reduced, type = "response")
-  prob_full <- predict(model_full, type = "response")
+  model_full <- glm(
+    full_formula,
+    data = analysis_data,
+    family = binomial()
+  )
 
-  # AUC
-  roc_base <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_base, quiet = TRUE)
-  roc_full <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_full, quiet = TRUE)
+  probability_base <- predict(
+    model_reduced,
+    type = "response"
+  )
 
-  auc_base <- as.numeric(pROC::auc(roc_base))
-  auc_full <- as.numeric(pROC::auc(roc_full))
+  probability_full <- predict(
+    model_full,
+    type = "response"
+  )
+
+  roc_base <- pROC::roc(
+    response = analysis_data$Phenotype,
+    predictor = probability_base,
+    quiet = TRUE
+  )
+
+  roc_full <- pROC::roc(
+    response = analysis_data$Phenotype,
+    predictor = probability_full,
+    quiet = TRUE
+  )
+
+  auc_base <- as.numeric(
+    pROC::auc(roc_base)
+  )
+
+  auc_full <- as.numeric(
+    pROC::auc(roc_full)
+  )
+
   auc_diff <- auc_full - auc_base
 
-  # Nagelkerke R²
-  nag_base <- unname(DescTools::PseudoR2(model_reduced, which = "Nagelkerke"))
-  nag_full <- unname(DescTools::PseudoR2(model_full, which = "Nagelkerke"))
-  nag_diff <- nag_full - nag_base
+  nagelkerke_base <- unname(
+    DescTools::PseudoR2(
+      model_reduced,
+      which = "Nagelkerke"
+    )
+  )
 
-  # PRS effect per SD
-  prs_row   <- coef(summary(model_full))["PRS_SD", ]
-  log_or    <- unname(prs_row["Estimate"])
-  se_log_or <- unname(prs_row["Std. Error"])
-  p_value   <- unname(prs_row["Pr(>|z|)"])
+  nagelkerke_full <- unname(
+    DescTools::PseudoR2(
+      model_full,
+      which = "Nagelkerke"
+    )
+  )
+
+  nagelkerke_diff <-
+    nagelkerke_full -
+    nagelkerke_base
+
+  prs_row <- coef(
+    summary(model_full)
+  )["PRS_SD", ]
+
+  log_or <- unname(
+    prs_row["Estimate"]
+  )
+
+  se_log_or <- unname(
+    prs_row["Std. Error"]
+  )
+
+  p_value <- unname(
+    prs_row["Pr(>|z|)"]
+  )
 
   or_per_sd <- exp(log_or)
-  or_ci     <- exp(c(log_or - 1.96 * se_log_or, log_or + 1.96 * se_log_or))
-  odds_increase_pct <- (or_per_sd - 1) * 100
 
-  logistic_txt <- glue("
+  or_ci <- exp(
+    c(
+      log_or - 1.96 * se_log_or,
+      log_or + 1.96 * se_log_or
+    )
+  )
+
+  results_text <- glue(
+    "
 Base model AUC:               {round(auc_base, 4)}
 Full model AUC:               {round(auc_full, 4)}
 Delta AUC (PRS):              {round(auc_diff, 4)}
 
-Base model Nagelkerke R²:     {round(nag_base, 4)}
-Full model Nagelkerke R²:     {round(nag_full, 4)}
-Delta Nagelkerke R² (PRS):    {round(nag_diff, 4)}
+Base model Nagelkerke R²:     {round(nagelkerke_base, 4)}
+Full model Nagelkerke R²:     {round(nagelkerke_full, 4)}
+Delta Nagelkerke R² (PRS):    {round(nagelkerke_diff, 4)}
 
 PRS effect per SD:
   Log-odds beta:              {round(log_or, 4)}
   OR per SD:                  {round(or_per_sd, 4)}
   95% CI for OR:              [{round(or_ci[1], 4)}, {round(or_ci[2], 4)}]
-  % increase in odds / SD:    {round(odds_increase_pct, 2)}%
   P-value:                    {signif(p_value, 4)}
-")
-
-  cat(logistic_txt, "\n")
-  print(summary(model_full))
-
-  results <- list(
-    trait_type         = trait_type,
-    n                  = nrow(analysis_data),
-    base_model         = model_reduced,
-    full_model         = model_full,
-    auc_base           = auc_base,
-    auc_full           = auc_full,
-    auc_diff           = auc_diff,
-    nagelkerke_base    = nag_base,
-    nagelkerke_full    = nag_full,
-    nagelkerke_diff    = nag_diff,
-    log_or_per_sd      = log_or,
-    or_per_sd          = or_per_sd,
-    or_ci_low          = or_ci[1],
-    or_ci_high         = or_ci[2],
-    odds_increase_pct  = odds_increase_pct,
-    p_value            = p_value
+"
   )
 
-} else {
-  stop("trait_type must be either 'continuous' or 'binary'.")
+  cat(
+    results_text,
+    "\n"
+  )
+
+  print(
+    summary(model_full)
+  )
 }
+```
 
+# Save scores and results
 
+```{r}
+write_tsv(
+  analysis_data,
+  file.path(
+    output_dir,
+    paste0(
+      study,
+      "_lassosum_scores.tsv"
+    )
+  )
+)
 
-
-
-
+saveRDS(
+  sv,
+  file.path(
+    output_dir,
+    paste0(
+      study,
+      "_splitvalidate.rds"
+    )
+  )
+)
+```
