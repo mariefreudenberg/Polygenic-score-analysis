@@ -1,0 +1,78 @@
+---
+title: "PRSvsFST"
+output: html_document
+date: "2025-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(glue)
+library(ggplot2)
+```
+
+```{r}
+trait <- "BMI"
+```
+
+```{r}
+prs <- read_table(glue("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/{trait}_PRS_output.sscore"))
+
+prs_means <- prs %>%
+  group_by(Population) %>%
+  summarise(mean_prs = mean(SCORE1_SUM), .groups = "drop")
+```
+
+#Calculate pairwise difference of PRS between populations
+
+```{r}
+prs_diff <- prs_means %>%
+  rename(Pop1 = Population, mean1 = mean_prs) %>%
+  crossing(rename(prs_means, Pop2 = Population, mean2 = mean_prs)) %>%
+  filter(Pop1 < Pop2) %>%  # avoid duplicates like A–B and B–A
+  mutate(PRS_diff = abs(mean1 - mean2))
+```
+
+```{r}
+print(prs_diff)
+```
+
+#Join PRS and FST data
+
+```{r}
+# Set the path to your files
+fst_file <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations.fst.summary"
+```
+
+```{r}
+# Read the FST summary
+fst_data <- read.delim(fst_file, header = TRUE, sep = "\t", comment.char = "")
+colnames(fst_data)[colnames(fst_data) == "X.POP1"] <- "Pop1"
+colnames(fst_data)[colnames(fst_data) == "POP2"] <- "Pop2"
+```
+
+```{r}
+combined <- left_join(prs_diff, fst_data, by = c("Pop1", "Pop2"))
+```
+
+```{r}
+print(combined)
+```
+
+#Plot and test for correlation 
+```{r}
+ggplot(combined, aes(x = HUDSON_FST, y = PRS_diff)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "PRS difference vs FST between populations",
+       x = "FST", y = "PRS difference") +
+  theme_minimal()
+```
+```{r}
+cor.test(combined$HUDSON_FST, combined$PRS_diff)
+```
+

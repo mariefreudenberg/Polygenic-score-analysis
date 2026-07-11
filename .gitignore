@@ -1,0 +1,28 @@
+# Data
+data/
+results/
+figures/
+
+# Large data files
+*.csv
+*.tsv
+*.txt
+*.rds
+*.RData
+*.bed
+*.bim
+*.fam
+*.pgen
+*.pvar
+*.psam
+
+# RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Rendered documents
+*.html
+*.pdf
+*.docx

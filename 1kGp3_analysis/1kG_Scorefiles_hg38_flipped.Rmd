@@ -1,0 +1,179 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(glue)
+```
+
+# Specify trait and file
+```{r}
+trait <- "Diabetes"
+PGSfile <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/PGS000014.txt.gz"
+```
+```{r}
+pvar <- read_tsv("R:/Doktoranden/MarieFreudenberg/daten/1kG_ph3/1kgALL_ph3_hg38_maf001_uniqueSNPIDs.pvar",
+                 comment = "##", col_names = TRUE)
+```
+
+# Read PGS file 
+```{r}
+read_prs_file <- function(PGSfile) {
+  # Read first 50 lines
+  header_lines <- readLines(PGSfile, n = 50)
+  
+  # Count how many start with "#"
+  skip_lines <- sum(grepl("^#", header_lines))
+  
+  # Read file with auto-calculated skip
+  read_delim(PGSfile, skip = skip_lines)
+}
+pgs <- read_prs_file(PGSfile)
+```
+
+# change file to bed format (0-based, half-open)
+```{r, eval = FALSE}
+bed <- pgs %>%
+  mutate(
+    chrom = paste0("chr", chr_name),
+    start = chr_position - 1,
+    end = chr_position,
+    id = row_number()
+  ) %>%
+  select(chrom, start, end, id)
+
+bed_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/{trait}_pgs_hg19.bed")
+write_tsv(bed, bed_path, col_names = FALSE)
+```
+
+# go to this website and convert bed file from hg19 to hg38 and manually move and rename the file to {trait}_pgs_hg38.bed
+# https://genome.ucsc.edu/cgi-bin/hgLiftOver
+
+# bed file needs to be converted back to a scorefile
+```{r}
+bed_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/{trait}_pgs_hg38.bed")
+lifted <- read_tsv(bed_path, col_names = FALSE) %>%
+  select(1:4) %>%
+  rename(chr_hg38 = X1, start_hg38 = X2, end_hg38 = X3, row_id = X4) %>%
+  mutate(
+    pos_hg38 = end_hg38,
+    row_id = as.character(row_id)
+  )
+
+pgs <- pgs %>%
+  mutate(row_id = as.character(row_number()))
+
+pgs_lifted <- inner_join(pgs, lifted, by = "row_id")
+```
+
+```{r}
+scorefile <- pgs_lifted %>%
+  mutate(
+    chr_position = pos_hg38,
+    SNP = paste0(chr_name, ":", chr_position, ":", effect_allele, ":", other_allele)
+  ) %>%
+  select(SNP, A1 = effect_allele, BETA = effect_weight)
+```
+
+# OPTIONAL: Check how many original SNP ID match, how many flipped IDs would match and how many positions overlap?
+```{r, eval = FALSE}
+scorefile_info <- scorefile %>%
+  mutate(
+    chr = str_extract(SNP, "^[0-9XY]+"),
+    pos = str_extract(SNP, "(?<=:)[0-9]+") %>% as.integer(),
+    ref = str_extract(SNP, ":[ACGT]+(?=:)") %>% str_remove("^:"),
+    alt = str_extract(SNP, ":[ACGT]+$") %>% str_remove("^:"),
+    POS_key = paste0(chr, ":", pos),
+    SNP_flipped = paste0(chr, ":", pos, ":", alt, ":", ref)
+  )
+
+pvar <- pvar %>%
+  mutate(
+    chr = as.character(`#CHROM`),
+    POS_key = paste0(chr, ":", POS)
+  )
+
+n_total <- nrow(scorefile_info)
+n_original_matched <- sum(scorefile_info$SNP %in% pvar$ID)
+n_flipped_matched  <- sum(scorefile_info$SNP_flipped %in% pvar$ID)
+n_total_matched    <- sum(scorefile_info$SNP %in% pvar$ID | scorefile_info$SNP_flipped %in% pvar$ID)
+n_unmatched        <- n_total - n_total_matched
+
+pos_overlap <- intersect(scorefile_info$POS_key, pvar$POS_key)
+n_pos_overlap <- length(pos_overlap)
+
+# Print summary report
+cat(glue("
+Total SNPs in scorefile:     {n_total}
+Matched by original ID:      {n_original_matched}
+Matched by flipped ID:       {n_flipped_matched}
+Total SNPs matched:          {n_total_matched}
+Unmatched SNPs:              {n_unmatched}
+Positions matched (POS_key): {n_pos_overlap}
+Position match rate:         {round(n_pos_overlap / n_total * 100, 2)}%
+"))
+```
+
+# create a s second ID column for the flipped SNP IDs
+```{r}
+scorefile <- scorefile %>%
+  mutate(
+    chr   = str_extract(SNP, "^[0-9XY]+"),
+    pos   = str_extract(SNP, "(?<=:)[0-9]+"),
+    ref   = str_extract(SNP, ":[ACGT]+(?=:)") %>% str_remove("^:"),
+    alt   = str_extract(SNP, ":[ACGT]+$") %>% str_remove("^:"),
+    SNP_flipped = paste0(chr, ":", pos, ":", alt, ":", ref)
+  )
+```
+
+# check which of these two IDs match with the pvar file and keep only the matching ID to create a new scorefile (if neither match keep original) 
+```{r}
+scorefile <- scorefile %>%
+  mutate(
+    in_pvar_original = SNP %in% pvar$ID,
+    in_pvar_flipped  = SNP_flipped %in% pvar$ID,
+    
+    SNP_final = case_when(
+      in_pvar_original ~ SNP,
+      in_pvar_flipped  ~ SNP_flipped,
+      TRUE ~ SNP  # fallback to original
+    ),
+    
+    was_flipped = in_pvar_flipped & !in_pvar_original,
+    was_matched = in_pvar_original | in_pvar_flipped
+  )
+```
+
+# OPTIONAL: print how many of the original IDs were actually replaced by flipped ID
+```{r}
+total <- nrow(scorefile)
+n_flipped <- sum(scorefile$was_flipped)
+n_matched <- sum(scorefile$was_matched)
+n_unmatched <- total - n_matched
+
+cat(glue::glue("
+Total SNPs: {total}
+Matched original: {n_matched - n_flipped}
+Matched flipped:  {n_flipped}
+Unmatched:        {n_unmatched}
+"))
+```
+
+# create a final scorefile and save as tsv
+```{r}
+final_scorefile <- scorefile %>%
+  select(SNP = SNP_final, A1, BETA) %>%
+  distinct(SNP, .keep_all = TRUE)
+
+write_tsv(final_scorefile, glue("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/{trait}_hg38_scorefile_matched_and_flipped.txt"))
+```
+

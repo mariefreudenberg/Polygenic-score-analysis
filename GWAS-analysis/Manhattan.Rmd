@@ -1,0 +1,159 @@
+---
+title: "LIFE_FST"
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r libraries}
+library(qqman)
+```
+# Read in GWAS results 
+```{r}
+gwasResults <- "R:/Doktoranden/MarieFreudenberg/analysen/GWAS/plinkresults.BMI.glm.linear_harmonized_minimal.txt.gz"
+
+# create data frame
+df <- read.table(gwasResults, header = TRUE, sep = "\t")
+```
+
+# GWAS used for PGS score 
+```{r}
+gwasResults <- "R:/Doktoranden/MarieFreudenberg/analysen/sumstats/GCST006900.tsv"
+df <- read.table(
+  gwasResults,
+  header = TRUE,
+  sep = ",",             # important: your file is comma-separated
+  stringsAsFactors = FALSE
+)
+
+df$SNP <- paste0(df$chr, ":", df$pos)
+```
+```{r}
+head(df)
+nrow(df)
+df <- subset(df, !chr %in% c("X", "Y", "MT"))
+df$chr <- as.numeric(df$chr)
+df$pos <- as.numeric(df$pos)
+df$p   <- as.numeric(df$p)
+```
+
+```{r}
+head(df)
+```
+
+# Read in pvar and compare nuber of variants in GWAS and pvar
+```{r}
+pvar <- read_tsv("R:/Doktoranden/MarieFreudenberg/genetik_LIFE_Adult/LIFE-Adult_TOPMed_minimal_filtered_chr1to23.pvar",
+                 comment = "##", col_names = TRUE)
+```
+```{r}
+GWAS_lines <- R.utils::countLines(gwasResults)
+pvar_lines <- nrow(pvar)
+cat("GWAS variants:", GWAS_lines, "\n", "pvar variants:", pvar_lines, "\n")
+```
+
+# check if there are any NA's as pval 
+```{r}
+summary(df$p)
+table(is.na(df$p))
+head(df[!is.finite(-log10(df$p)) | df$p <= 0 | df$p > 1, c("SNP","chr","pos","p")], 20)
+```
+# revove lines with NA
+```{r}
+library(dplyr)
+df <- df %>%
+  filter(!is.na(p))
+```
+# remove zeros
+```{r}
+# smallest non-zero p in the data
+min_nonzero <- min(df$p[df$p > 0], na.rm = TRUE)
+
+# choose a floor slightly smaller than that
+p_floor <- max(.Machine$double.xmin, min_nonzero / 10)
+
+# new column only for plotting
+df$p_plot <- ifelse(df$p <= 0 | is.na(df$p), p_floor, df$p)
+```
+
+# Manhatten Plot without highlighted SNPs
+```{r}
+manhattan(df, chr="chr", bp="pos", snp="SNP", p="pval" )
+```
+
+# SNPs from Boosting MAF 0.001
+```{r}
+snpsOfInterest <- unique(c(
+  "chr1:34462476:AT:A_A","chr1:78825637:A:G_G","chr1:184883972:T:G_G","chr1:204324452:C:G_G","chr1:239986692:G:GT_GT",
+  "chr2:18362422:C:T_T","chr2:197753410:T:G_G","chr2:35377330:T:C_C","chr2:51080482:T:C_C",
+  "chr3:23883634:A:G_G","chr3:59085826:T:G_G","chr3:65183053:A:T_T","chr3:80039406:T:G_G","chr3:150211647:A:AT_AT",
+  "chr4:70479721:T:C_C","chr4:72183843:T:C_C","chr4:173857843:A:G_G","chr4:178015450:A:G_G",
+  "chr5:28490216:T:G_G","chr5:133347722:G:A_A","chr5:167660630:T:C_C",
+  "chr6:2894043:T:A_A","chr6:16168214:A:G_G","chr6:23914418:TTTTC:T_T","chr6:41585740:TTGTCTC:T_T",
+  "chr6:114896844:AT:A_A","chr6:137798143:A:T_T",
+  "chr7:43263085:C:T_T","chr7:67355227:C:T_T","chr7:149364350:TACAA:T_T","chr7:154421467:C:T_T",
+  "chr8:76532107:G:A_A","chr8:102126065:A:T_T",
+  "chr9:32253409:C:CA_CA",
+  "chr10:24196340:C:T_T","chr10:33436612:A:G_G","chr10:33813109:C:T_T","chr10:97029019:G:A_A","chr10:126768480:CCTA:C_C","chr10:132530514:T:C_C",
+  "chr11:11755003:G:A_A","chr11:16863259:A:T_T","chr11:17282479:T:C_C","chr11:64999474:C:T_T","chr11:93195588:C:T_T",
+  "chr11:99800100:G:A_A","chr11:101213430:T:TATCA_TATCA",
+  "chr13:19970761:T:G_G","chr13:31096105:A:G_G","chr13:33921449:C:T_T","chr13:49619893:C:T_T",
+  "chr16:28286360:C:T_T","chr16:53772541:A:G_G","chr16:86605104:C:T_T",
+  "chr17:4132961:A:G_G","chr17:74046523:A:G_G","chr17:9112149:G:A_A","chr17:13284705:G:A_A",
+  "chr18:12501429:G:A_A","chr18:29760504:T:C_C","chr18:29848984:G:C_C","chr18:73625867:T:A_A",
+  "chr19:43305386:G:A_A","chr19:49192953:A:G_G","chr19:8906534:A:G_G",
+  "chr20:10435290:G:C_C","chr20:18262569:T:C_C","chr20:44246733:G:T_T","chr20:56359929:C:T_T","chr20:60894088:T:C_C",
+  "chr21:36733100:A:AG_AG","chr21:43650515:T:G_G",
+  "chr22:32586410:A:G_G","chr22:32798140:G:A_A",
+  "chrX:14066578:G:A_A","chrX:44723749:C:T_T","chrX:115693394:C:G_G","chrX:142334781:AG:A_A"
+))
+
+# remove 'chr' and effect allele from snpids
+snpsOfInterest <- gsub("^chr|_[A-Za-z]+$", "", snpsOfInterest)
+
+```
+# MAF 0.01
+```{r}
+beta_df <- read.table("R:/Doktoranden/MarieFreudenberg/analysen/Boosting/final_betas.tsv", header = TRUE, sep = "\t")
+
+# List of SNPs = predictors that are NOT the intercept and NOT covariates
+covs <- beta_df$configs[['covariates']]
+
+snpsOfInterest <- beta_df$Predictor[
+  !(beta_df$Predictor %in% c("(Intercept)", covs))
+]
+snpsOfInterest <- gsub("^chr|_[A-Za-z]+$", "", snpsOfInterest)
+```
+#  PGS score top 1000
+```{r}
+beta_df <- read.table("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/top1000_betas_yengo.tsv", header = TRUE, sep = "\t")
+
+snpsOfInterest <- beta_df$SNP
+# snpsOfInterest <- gsub("^chr|_[A-Za-z]+$", "", snpsOfInterest)
+snpsOfInterest <- sub("^chr([^:]+:[0-9]+):.*$", "\\1", snpsOfInterest)
+```
+
+# Plot with highlighted SNPs
+```{r}
+manhattan(df, chr="chr", bp="pos", snp="SNP", p="p_plot", highlight = snpsOfInterest)
+```
+
+# Check which SNPs are missing in the Plot 
+```{r}
+#print(snpsOfInterest)
+#head(df$snpid, 10)
+missing <- setdiff(snpsOfInterest, df$SNP)  # in snpsOfInterest but not in df
+length(missing)
+```
+
+```{r}
+manhattan(df, chr="chr", bp="pos", snp="SNP", p="p", annotatePval = 0.01)
+```
+
+
+
+

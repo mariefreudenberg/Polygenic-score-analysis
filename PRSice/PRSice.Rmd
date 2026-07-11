@@ -1,0 +1,238 @@
+---
+title: "PRSice workflow"
+output: html_document
+---
+
+# load libraries
+```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(glue)
+library(data.table)
+```
+
+# define file paths
+# sumstats need to have the columns SNP, CHR, BP, A1, A2, OR or BETA, P 
+```{r}
+trait <- "Diabetes"
+study <- "Mahajan.NatGenet2018b.T2D.European"
+
+#base_path   <- "R:/Doktoranden/MarieFreudenberg/analysen/PRSice/"
+base_path   <- "H:/PRSice/"
+prsice_dir  <- file.path(base_path, "PRSice_win64")
+prsice_r    <- file.path(prsice_dir, "PRSice.R")
+prsice_bin  <- file.path(prsice_dir, "PRSice_win64.exe")
+
+# input files
+target_prefix <- file.path(base_path, "LIFE_bed")
+base_gwas     <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/sumstats/{study}.tsv")))
+pheno_covars_file <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/Phenofiles/{trait}_covars.tsv")))
+
+# output
+out_prefix <- file.path(base_path, trait, "results", "prsice")
+dir.create(dirname(out_prefix), showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+sumstats <- (base_gwas)
+head(sumstats)
+```
+# rename columns 
+```{r}
+sumstats <- sumstats %>%
+  transmute(
+   # SNP  = SNP,
+    CHR  = chr,
+    BP   = pos,
+    A1   = a1,
+    A2   = a0,
+    BETA = beta,
+    P    = p
+  )
+```
+
+# remove doublicates from sumstats
+```{r}
+# allele-order-independent key
+sumstats[, dup_key := paste(CHR, BP, pmin(A1, A2), pmax(A1, A2), sep=":")]
+
+# inspect duplicated variants
+dup_rows <- sumstats[duplicated(dup_key) | duplicated(dup_key, fromLast = TRUE)]
+dup_rows[order(dup_key)]
+
+# keep only one row per duplicated variant
+sumstats <- sumstats[!duplicated(dup_key)]
+
+# clean up
+sumstats[, dup_key := NULL]
+```
+
+# naming in LIFE bim is SNP ID = CHR : BP : A2 : A1
+# adjust sumstats accordingly
+```{r}
+# read bim file
+bim <- fread(
+  paste0(target_prefix, ".bim"),
+  header = FALSE,
+  col.names = c("CHR_bim", "SNP_bim", "CM", "BP_bim", "BIM_A1", "BIM_A2")
+)
+
+# create SNP IDs in both allele orders
+sumstats[, SNP := paste(CHR, BP, A1, A2, sep=":")]
+sumstats[, SNP_flipped := paste(CHR, BP, A2, A1, sep=":")]
+
+# check which version matches the bim SNP IDs
+sumstats[, match_original := SNP %in% bim$SNP_bim]
+sumstats[, match_flipped  := SNP_flipped %in% bim$SNP_bim]
+
+# prefer flipped ID if it matches, otherwise keep original
+sumstats[, SNP := ifelse(match_flipped, SNP_flipped, SNP)]
+
+# position needs to be an integer (no scientific writing)
+sumstats[, BP := as.integer(BP)]
+
+# save as tsv
+fwrite(sumstats, file.path(glue(base_path, trait, "/{study}_prsice.tsv")), sep = "\t")
+```
+# check overlap
+```{r}
+# number of matches
+n_overlap   <- sum((sumstats$SNP %in% bim$SNP_bim) | (sumstats$SNP_flipped %in% bim$SNP_bim))
+
+cat("Total sumstats:   ", nrow(sumstats), "\n")
+cat("Total bim SNPs:   ", nrow(bim), "\n")
+cat("Overlap:          ", n_overlap, "\n")
+```
+
+```{r}
+base_gwas     <- file.path(glue(base_path, trait, "/{study}_prsice.tsv"))
+```
+
+# Read in pheno and covar files, if they don' exist yet they need to be created using the next code chunk
+```{r}
+# define file paths
+pheno_file <- file.path(base_path, trait, "phenodata.tsv")
+cov_file <- file.path(base_path, trait, "covardata.tsv")
+```
+
+```{r}
+# recode sex to 1 and 2 
+pheno_covars_file[, Sex := fifelse(Sex == "Male", 1,
+                            fifelse(Sex == "Female", 2, NA_real_))]
+
+# create pheno file
+pheno <- pheno_covars_file[, .(
+  FID = IID,
+  IID = IID,
+  Phenotype = Phenotype
+)]
+
+# create covariate file
+cov <- pheno_covars_file[, .(
+  FID = IID,
+  IID = IID,
+  Sex = Sex,
+  Age = Age,
+  PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10
+)]
+
+# save as tab-separated files
+fwrite(pheno, file.path(base_path, trait, "phenodata.tsv"), sep = "\t")
+fwrite(cov, file.path(base_path, trait, "covardata.tsv"), sep = "\t")
+
+pheno_file <- file.path(base_path, trait, "phenodata.tsv")
+cov_file <- file.path(base_path, trait, "covardata.tsv")
+```
+# run PRSice
+```{r}
+args <- c(
+  prsice_r,
+  "--dir", prsice_dir,
+  "--prsice", prsice_bin,
+  "--base", base_gwas,
+  "--target", target_prefix,
+  "--pheno", pheno_file,
+  "--pheno-col", "Phenotype",
+  "--cov", cov_file,
+  "--cov-col", "Age,Sex,PC1,PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10",
+  "--stat", "BETA",
+  "--beta",
+  "--binary-target", "T", # for binary trait use T and for continuous trait use F
+  "--thread", "4",
+  "--out", out_prefix
+)
+
+cmd <- file.path(R.home("bin"), "Rscript")
+res <- system2(cmd, args = args, stdout = TRUE, stderr = TRUE)
+cat(paste(res, collapse = "\n"))
+```
+
+
+```{r read-results}
+prsice_res <- read.table(
+  paste0(out_prefix, ".summary"),
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+head(prsice_res)
+```
+
+# for binary traits AUC needs to be computed 
+```{r}
+library(pROC)
+
+prs <- fread("H:/PRSice/Diabetes/results/prsice.best")
+pheno <- fread("H:/PRSice/Diabetes/phenodata.tsv")
+covar <- fread("H:/PRSice/Diabetes/covardata.tsv")
+
+data <- merge(prs, pheno, by=c("FID","IID"))
+data <- merge(data, covar, by=c("FID","IID"))
+
+# PRS + covariates (full model)
+model_full <- glm(
+  Phenotype ~ PRS + Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10,
+  data = data,
+  family = binomial
+)
+
+# covariates only (base model)
+model_null <- glm(
+  Phenotype ~ Age + Sex + PC1 + PC2 + PC3 + PC4 + PC5 + PC6 + PC7 + PC8 + PC9 + PC10,
+  data = data,
+  family = binomial
+)
+
+auc_full <- roc(data$Phenotype, predict(model_full, type="response"))$auc
+auc_null <- roc(data$Phenotype, predict(model_null, type="response"))$auc
+
+auc_full
+auc_null
+```
+# Odds ratio per SD increase in PRS
+```{r}
+# standardize PRS
+data[, PRS_SD := as.numeric(scale(PRS))]
+
+# logistic regression with standardized PRS
+model_or <- glm(
+  Phenotype ~ PRS_SD + Age + Sex +
+    PC1 + PC2 + PC3 + PC4 + PC5 +
+    PC6 + PC7 + PC8 + PC9 + PC10,
+  data = data,
+  family = binomial()
+)
+
+# extract coefficient and standard error
+coef_prs <- coef(summary(model_or))["PRS_SD", "Estimate"]
+se_prs   <- coef(summary(model_or))["PRS_SD", "Std. Error"]
+
+# OR and 95% CI
+OR <- exp(coef_prs)
+CI_lower <- exp(coef_prs - 1.96 * se_prs)
+CI_upper <- exp(coef_prs + 1.96 * se_prs)
+
+cat("Odds Ratio per SD increase in PRS:", round(OR, 3), "\n")
+cat("95% CI:", round(CI_lower, 3), "-", round(CI_upper, 3), "\n")
+```
+

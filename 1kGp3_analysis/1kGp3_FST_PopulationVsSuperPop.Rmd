@@ -1,0 +1,130 @@
+---
+title: "1kGp3_FST"
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r libraries}
+library(tidyverse)
+library(data.table)
+library(knitr)
+```
+```{r}
+plink2 <- "C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe" 
+analysis_dir <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST"
+basename <- "1kgALL_ph3_hg38_maf001_uniqueSNPIDs"
+base <- file.path(analysis_dir, basename)
+```
+
+```{r}
+psam <- fread(file.path(analysis_dir, paste0(basename, ".psam")))
+psam <- psam %>% rename(IID = `#IID`)
+```
+```{r}
+head(psam)
+nrow(psam)
+```
+
+#create SuperPops without specific Populations for later comparison
+```{r}
+pops <- unique(psam$Population)
+for (pop in pops) {
+  # Get SuperPop of current population
+  superpop <- unique(psam$SuperPop[psam$Population == pop])
+
+  # Build new SuperPop column
+  temp_map <- psam %>%
+    mutate(SuperPopMod = case_when(
+      Population == pop ~ pop,  # leave target pop as its own group
+      SuperPop == superpop ~ paste0(superpop, "_minus_", pop),  # rename superpop
+      TRUE ~ SuperPop  # others stay the same
+    )) %>%
+    mutate(FID = 0) %>%
+    select(FID, IID, SuperPopMod)
+
+  # Write to file for this population
+  fwrite(temp_map,
+         paste0("SuperPop_mapping_excl_", pop, ".txt"),
+         sep = "\t")
+}
+```
+
+```{r}
+for (pop in pops) {
+  map_path <- paste0("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/SuperPop_mapping_excl_", pop, ".txt")
+  out_path <- paste0("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/FST_excl_", pop)
+  
+cmd <- paste0("C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe ",
+              "--pfile R:/Doktoranden/MarieFreudenberg/daten/1kG_ph3/1kgALL_ph3_hg38_maf001_uniqueSNPIDs ",
+              "--pheno ", shQuote(map_path), " ",
+              "--pheno-name SuperPopMod ",
+              "--fst SuperPopMod ",
+              "--out ", shQuote(out_path))
+  
+  cat("Running:", cmd, "\n")  # Optional: to see each command
+  system(cmd)
+}
+```
+
+#Plot heatmap of pairwise FST
+
+```{r}
+library(pheatmap)
+library(reshape2)
+```
+
+
+```{r}
+all_fst <- data.frame()
+
+for (pop in pops) {
+  file <- paste0("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/FST_excl_", pop, ".fst.summary")
+  dat <- fread(file)
+  colnames(dat) <- gsub("^X\\.", "", colnames(dat))
+colnames(dat) <- gsub("^#", "", colnames(dat))
+  # Find the row where POP1 or POP2 is the focal pop
+  row <- dat %>% filter(POP1 == pop | POP2 == pop)
+  row$TargetPop <- pop
+  all_fst <- rbind(all_fst, row)
+}
+```
+
+
+```{r}
+all_fst <- all_fst %>%
+  mutate(SuperPop = ifelse(POP1 == TargetPop, POP2, POP1),
+         SuperPop = gsub("_minus_.*", "", SuperPop))
+```
+
+```{r}
+library(tidyr)
+
+fst_wide <- all_fst %>%
+  select(TargetPop, SuperPop, HUDSON_FST) %>%
+  pivot_wider(names_from = SuperPop, values_from = HUDSON_FST)
+
+# Set rownames as TargetPop
+fst_matrix <- as.data.frame(fst_wide)
+rownames(fst_matrix) <- fst_matrix$TargetPop
+fst_matrix <- fst_matrix[, -1]
+```
+
+
+```{r}
+pheatmap(as.matrix(fst_matrix),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         display_numbers = TRUE,
+         main = "FST: Population vs SuperPop (minus self)",
+         fontsize_row = 10,
+         fontsize_col = 10)
+```
+
+
+
+

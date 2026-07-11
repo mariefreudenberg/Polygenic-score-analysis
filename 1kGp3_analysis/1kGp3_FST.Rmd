@@ -1,0 +1,133 @@
+---
+title: "1kGp3_FST"
+output: html_document
+date: "2025-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load libraries
+```{r libraries}
+library(tidyverse)
+library(data.table)
+library(knitr)
+```
+```{r}
+plink2 <- "C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe" 
+analysis_dir <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST"
+basename <- "1kgALL_ph3_hg38_maf001_uniqueSNPIDs"
+base <- file.path(analysis_dir, basename)
+```
+
+```{r}
+psam <- fread(file.path(analysis_dir, paste0(basename, ".psam")))
+psam <- psam %>% rename(IID = `#IID`)
+```
+```{r}
+head(psam)
+nrow(psam)
+```
+```{r}
+pop_map <- psam %>%
+  select(IID, Population) %>%
+  mutate(FID = 0) %>%
+  select(FID, IID, Population)
+fwrite(pop_map, "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/population_mapping.txt", sep = "\t")
+```
+
+# pairwise FST using plink2
+```{r}
+system("C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe --pfile R:/Doktoranden/MarieFreudenberg/daten/1kG_ph3/1kgALL_ph3_hg38_maf001_uniqueSNPIDs --fst Population --out R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations")
+```
+
+#Plot heatmap of pairwise FST
+
+```{r}
+library(pheatmap)
+library(reshape2)
+```
+
+```{r}
+# Set the path to your files
+fst_file <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations.fst.summary"
+```
+
+```{r}
+# Read the FST summary
+fst_data <- read.delim(fst_file, header = TRUE, sep = "\t", comment.char = "")
+colnames(fst_data)[colnames(fst_data) == "X.POP1"] <- "POP1"
+```
+
+```{r}
+# Inspect column names
+head(fst_data) 
+```
+```{r}
+pop_order <- c(
+  # AFR (African)
+  "ACB", "ASW", "ESN", "GWD", "LWK", "MSL", "YRI",
+  
+  # AMR (Admixed American)
+  "CLM", "MXL", "PEL", "PUR",
+  
+  # EAS (East Asian)
+  "CDX", "CHB", "CHS", "JPT", "KHV",
+  
+  # EUR (European)
+  "CEU", "FIN", "GBR", "IBS", "TSI",
+  
+  # SAS (South Asian)
+  "BEB", "GIH", "ITU", "PJL", "STU"
+)
+```
+
+
+```{r}
+# Create an empty matrix
+fst_matrix <- matrix(NA, nrow = length(pop_order), ncol = length(pop_order))
+rownames(fst_matrix) <- pop_order
+colnames(fst_matrix) <- pop_order
+```
+```{r}
+print(pop_order)
+```
+
+```{r}
+# Fill matrix with FST values
+for (i in 1:nrow(fst_data)) {
+  p1 <- fst_data$POP1[i]
+  p2 <- fst_data$POP2[i]
+  fst <- fst_data$HUDSON_FST[i]
+  fst_matrix[p1, p2] <- fst
+  fst_matrix[p2, p1] <- fst  # symmetric
+}
+```
+
+```{r}
+# Set diagonal to 0 (or NA if you prefer)
+diag(fst_matrix) <- NA
+```
+
+```{r}
+print(fst_matrix)
+```
+
+
+```{r}
+# Plot the heatmap
+pheatmap(fst_matrix,
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         display_numbers = TRUE,
+         main = "Pairwise FST Heatmap",
+         fontsize_row = 10,
+         fontsize_col = 10)
+```
+
+
+
+

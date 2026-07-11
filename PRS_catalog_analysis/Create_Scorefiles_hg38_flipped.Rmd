@@ -1,0 +1,123 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+--------------------------------------------------------------------------------------------------------
+# create scorefiles from PGS catalog downloads (usually in hg19 so they need to be lifted to hg38 first)
+--------------------------------------------------------------------------------------------------------
+
+# load libraries 
+```{r}
+library(readr)
+library(dplyr)
+library(glue)
+library(stringr)
+```
+
+# Specify trait and file
+```{r}
+file <- "PGS005204"
+PGSfile <- glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}.txt")
+pvar <- read_tsv("R:/Doktoranden/MarieFreudenberg/genetik_LIFE_Adult/LIFE-Adult_TOPMed_minimal_filtered_chr1to23.pvar",
+                 comment = "##", col_names = TRUE)
+```
+
+# Read PGS file 
+```{r}
+read_prs_file <- function(PGSfile) {
+  # Read first 50 lines
+  header_lines <- readLines(PGSfile, n = 50)
+  
+  # Count how many start with "#"
+  skip_lines <- sum(grepl("^#", header_lines))
+  
+  # Read file with auto-calculated skip
+  read_delim(PGSfile, skip = skip_lines)
+}
+pgs <- read_prs_file(PGSfile)
+```
+# if the file is in hg19 it needs to be converted to 38
+# change file to bed format (0-based, half-open)
+```{r}
+bed <- pgs %>%
+  mutate(
+    chrom = paste0("chr", chr_name),
+    start = chr_position - 1,
+    end = chr_position,
+    id = row_number()
+  ) %>%
+  select(chrom, start, end, id)
+
+bed_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_hg19.bed")
+write_tsv(bed, bed_path, col_names = FALSE)
+```
+
+# go to this website and convert bed file from hg19 to hg38 and manually move and rename the file to {file}_hg38.bed
+# https://genome.ucsc.edu/cgi-bin/hgLiftOver
+
+# bed file needs to be converted back to a scorefile
+```{r}
+bed_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_hg38.bed")
+lifted <- read_tsv(bed_path, col_names = FALSE) %>%
+  select(1:4) %>%
+  rename(chr_hg38 = X1, start_hg38 = X2, end_hg38 = X3, row_id = X4) %>%
+  mutate(
+    pos_hg38 = end_hg38,
+    row_id = as.character(row_id)
+  )
+
+pgs <- pgs %>%
+  mutate(row_id = as.character(row_number()))
+
+pgs_lifted <- inner_join(pgs, lifted, by = "row_id")
+```
+
+# rename SNP ID to match LIFE-Adult genodata
+```{r}
+scorefile <- pgs_lifted %>%
+  mutate(
+    chr_name = gsub("^chr", "", chr_hg38),   # clean up chromosome label
+    chr_name = paste0("chr", chr_name),      # ensure consistent format
+    chr_position = pos_hg38,
+    SNP = paste0(chr_name, ":", chr_position, ":", effect_allele, ":", other_allele)
+  ) %>%
+  select(SNP, A1 = effect_allele, BETA = effect_weight)
+```
+
+# the order of the two alleles in some SNP IDs need to be flipped 
+# create a s second ID column for the flipped SNP IDs
+```{r}
+scorefile <- scorefile %>%
+  mutate(
+    chr   = str_extract(SNP, "^chr[0-9XY]+"),
+    pos   = str_extract(SNP, "(?<=:)[0-9]+"),
+    ref   = str_extract(SNP, ":[ACGT]+(?=:)") %>% str_remove("^:"),
+    alt   = str_extract(SNP, ":[ACGT]+$") %>% str_remove("^:"),
+    SNP_flipped = paste0(chr, ":", pos, ":", alt, ":", ref)
+  )
+```
+
+# check which of these two IDs match with the pvar file and keep only the matching ID (if neither match keep original) 
+```{r}
+scorefile <- scorefile %>%
+  mutate(
+    match_flipped  = SNP_flipped %in% pvar$ID,
+    match_original = SNP %in% pvar$ID,
+    SNP = if_else(match_flipped, SNP_flipped, SNP)  # prefer flipped when it matches
+  ) %>%
+  select(-SNP_flipped, -match_flipped, -match_original) 
+```
+
+# create a final scorefile and save as tsv
+```{r}
+final_scorefile <- scorefile %>%
+  select(SNP, A1, BETA) %>%
+  distinct(SNP, .keep_all = TRUE)
+
+write_tsv(final_scorefile, glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_scorefile.txt"))
+```

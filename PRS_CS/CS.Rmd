@@ -1,0 +1,428 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries and define base path 
+```{r}
+.libPaths("H:/Rlibs")
+library(data.table)
+library(readr)
+library(dplyr)
+library(glue)
+library(pROC)
+library(DescTools)
+```
+
+# Read summary statistics file
+```{r}
+trait <- "Diabetes"
+study <- "Mahajan.NatGenet2018b.T2D.European"
+trait_type <- "binary"   # "continuous" or "binary"
+
+base_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/CS/{trait}/")
+ss <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/sumstats/{study}.tsv")))
+head(ss)
+```
+# LD ref basepair positions are in hg19 
+# If needed, add rsid to the sumstats ()
+```{r}
+ref <- fread("R:/Doktoranden/MarieFreudenberg/analysen/CS/ldblk_ukbb_eur/snpinfo_ukbb_hm3")
+
+# Standardize columns
+ss[, `:=`(
+  chr38 = sub("^chr", "", as.character(chr)),          # original hg38 chr
+  pos38 = as.integer(pos),                             # original hg38 pos
+  chr19 = sub("^chr", "", as.character(chr_hg19)),     # lifted hg19 chr
+  pos19 = as.integer(pos_hg19),                        # lifted hg19 pos  <- use this, not start_hg19
+  a1    = toupper(a1),
+  a0    = toupper(a0),
+  beta  = as.numeric(beta),
+  p     = as.numeric(p)
+)]
+
+ref[, `:=`(
+  chr19 = sub("^chr", "", as.character(CHR)),
+  pos19 = as.integer(BP),
+  A1    = toupper(A1),
+  A2    = toupper(A2)
+)]
+
+# Order-independent allele keys
+ss[, `:=`(
+  allele1 = pmin(a1, a0),
+  allele2 = pmax(a1, a0)
+)]
+
+ref[, `:=`(
+  allele1 = pmin(A1, A2),
+  allele2 = pmax(A1, A2)
+)]
+
+# Keep only needed reference columns and remove duplicates
+ref_map <- unique(
+  ref[, .(chr19, pos19, allele1, allele2, SNP)]
+)
+
+# Merge rsID onto sumstats using hg19 coordinates
+ss_annot <- merge(
+  ss,
+  ref_map,
+  by = c("chr19", "pos19", "allele1", "allele2"),
+  all.x = TRUE
+)
+
+# Keep only variants that got an rsID
+ss <- ss_annot[!is.na(SNP) & SNP != ""]
+
+cat("Number of sumstats variants with rsID:", nrow(ss), "\n")
+head(ss)
+```
+
+# sumstats need to have: SNP, A1, A2, BETA, SE (or P instead of SE)
+```{r}
+prscs_ss <- ss[
+  !is.na(rsid) & !is.na(beta) & !is.na(p),
+  .(
+    SNP  = rsid,
+    A1   = a1,
+    A2   = a0,
+    BETA = beta,
+    P    = p
+  )
+]
+
+fwrite(
+  prscs_ss,
+  file = file.path(base_path, glue("{study}_PRScs.txt")),
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+```
+
+# Add rsid to LIFE-Adult bim files(use rsid from the sumstats - keep only snps from sumstats)
+```{r}
+bim <- fread("R:/Doktoranden/MarieFreudenberg/analysen/CS/LIFE_bed.bim")
+setnames(bim, c("CHR", "SNP_old", "CM", "POS", "A1", "A2"))
+
+# make join columns consistent immediately
+bim[, `:=`(
+  CHR = as.character(CHR),
+  POS = as.integer(POS),
+  A1  = toupper(A1),
+  A2  = toupper(A2)
+)]
+
+bim[, `:=`(
+  allele1 = pmin(A1, A2),
+  allele2 = pmax(A1, A2)
+)]
+
+ss_map <- unique(
+  ss[
+    !is.na(rsid) & !is.na(chr) & !is.na(pos),
+    .(
+      CHR = as.character(chr),
+      POS = as.integer(pos),
+      allele1 = as.character(a1),
+      allele2 = as.character(a0),
+      rsid = rsid
+    )
+  ]
+)
+
+map <- merge(
+  bim[, .(CHR, POS, allele1, allele2, SNP_old)],
+  ss_map,
+  by = c("CHR", "POS", "allele1", "allele2")
+)
+
+renamer <- unique(map[, .(oldID = SNP_old, newID = rsid)])
+
+fwrite(
+  renamer,
+  file = file.path(base_path, glue("{study}_rename_to_rsid.txt")),
+  sep = "\t",
+  col.names = FALSE,
+  quote = FALSE
+)
+
+keep_snps_new <- unique(map$rsid)
+
+fwrite(
+  data.table(SNP = keep_snps_new),
+  file = file.path(base_path, glue("{study}_rsid.txt")),
+  sep = "\t",
+  col.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{r}
+extract_file <- glue("{base_path}/{study}_rsid.txt")
+rename_file  <- glue("{base_path}/{study}_rename_to_rsid.txt")
+out_prefix   <- glue("{base_path}/{study}_LIFE_rsid")
+
+cmd <- paste(
+  shQuote("C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe"),
+  "--bfile", shQuote("R:/Doktoranden/MarieFreudenberg/analysen/CS/LIFE_bed"),
+  "--extract", shQuote(extract_file),
+  "--update-name", shQuote(rename_file), "2", "1",
+  "--make-bed",
+  "--out", shQuote(out_prefix)
+)
+
+cat("Running:\n", cmd, "\n")
+system(cmd)
+```
+
+# run this command in python in PRScs-master directory 
+# python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED]
+
+# print full command (manually adjust GWAS sample size)
+```{r}
+bim_prefix <- out_prefix
+sst_file   <- glue("{base_path}/{study}_PRScs.txt")
+out_dir    <- glue("{base_path}/{study}_prscs")
+
+cmd <- paste(
+  "python PRScs.py",
+  paste0("--ref_dir=", shQuote("R:/Doktoranden/MarieFreudenberg/analysen/CS/ldblk_1kg_eur")),
+  paste0("--bim_prefix=", shQuote(bim_prefix)),
+  paste0("--sst_file=", shQuote(sst_file)),
+  "--n_gwas=900000",
+  paste0("--out_dir=", shQuote(out_dir)),
+  "--seed=1234"
+)
+
+cat(cmd, "\n")
+```
+
+# concatenate the 22 chr files into one big file and loose the columns that are not neccesary to score 
+```{r}
+# Find all PRS-CS effect files and stack them 
+files <- list.files(
+  path = base_path,
+  pattern = paste0("^", study, "_prscs_pst_eff"),
+  full.names = TRUE
+)
+
+length(files)        # should be 22
+files[1:5]
+
+allchr <- rbindlist(lapply(files, fread))
+
+# Rename columns for clarity
+setnames(allchr, c("CHR", "SNP", "BP", "A1", "A2", "BETA"))
+
+# Check overlap with BIM
+bim <- fread(file.path(glue(base_path, "{study}_LIFE_rsid.bim")))
+setnames(bim, c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+
+cat("Score SNPs:", length(unique(allchr$SNP)), "\n")
+cat("BIM SNPs:  ", length(unique(bim$SNP)), "\n")
+cat("Overlap:   ", length(intersect(allchr$SNP, bim$SNP)), "\n")
+
+# Create simple 3-column score file
+score <- allchr[, .(SNP, A1, BETA)]
+
+fwrite(
+  score,
+  file = file.path(glue(base_path, "{study}_prscs_scorefile.txt")),
+  sep = "\t"
+)
+```
+
+# score LIFE data
+```{r}
+score_file <- file.path(base_path, glue("{study}_prscs_scorefile.txt"))
+out_file   <- file.path(base_path, glue("{study}_individual_scores"))
+
+cmd <- paste(
+  shQuote("C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe"),
+  "--bfile", shQuote(out_prefix),
+  "--score", shQuote(score_file),
+  "1 2 3 header-read cols=+scoresums",
+  "--out", shQuote(out_file)
+)
+
+cat(cmd, "\n")
+system(cmd)
+```
+
+# Create file with phenotype, metadata and prs scores 
+# load files 
+```{r}
+data <- fread(glue("R:/Doktoranden/MarieFreudenberg/analysen/Phenofiles/{trait}_covars.tsv"))
+prs <- read_table(glue(base_path, "{study}_individual_scores.sscore"))
+```
+# Add PRS to covars data
+```{r}
+data <- data %>%
+  left_join(prs, by = "IID")
+data <- data[complete.cases(data), ]
+```
+
+# Run linear/logistic regression and check how much variance is explained by PRS
+```{r}
+outcome_var <- "Phenotype"
+prs_var     <- "BETA_SUM"
+covars      <- c("Age", "Sex", paste0("PC", 1:10))
+
+analysis_vars <- c(outcome_var, prs_var, covars)
+
+analysis_data <- as.data.frame(data[, ..analysis_vars])
+analysis_data <- analysis_data[complete.cases(analysis_data), ]
+
+analysis_data$PRS_SD <- as.numeric(scale(analysis_data[[prs_var]]))
+
+base_formula <- as.formula(
+  paste(outcome_var, "~", paste(covars, collapse = " + "))
+)
+
+full_formula <- as.formula(
+  paste(outcome_var, "~", paste(c("PRS_SD", covars), collapse = " + "))
+)
+
+trait_type <- tolower(trait_type)
+
+if (trait_type == "continuous") {
+
+  # Linear regression
+  model_reduced <- lm(base_formula, data = analysis_data)
+  model_full    <- lm(full_formula, data = analysis_data)
+
+  r2_base <- summary(model_reduced)$r.squared
+  r2_full <- summary(model_full)$r.squared
+  r2_prs  <- r2_full - r2_base
+
+  prs_row <- coef(summary(model_full))["PRS_SD", ]
+  prs_ci  <- confint(model_full, "PRS_SD")
+
+  var_explained_txt <- glue("
+Base model R²:                {round(r2_base, 4)}
+Full model R²:                {round(r2_full, 4)}
+Incremental R² (PRS):         {round(r2_prs, 4)}
+
+PRS effect per SD:
+  Beta:                       {round(unname(prs_row['Estimate']), 4)}
+  95% CI:                     [{round(prs_ci[1], 4)}, {round(prs_ci[2], 4)}]
+  P-value:                    {signif(unname(prs_row['Pr(>|t|)']), 4)}
+")
+
+  cat(var_explained_txt, "\n")
+  print(summary(model_full))
+
+  results <- list(
+    trait_type   = trait_type,
+    n            = nrow(analysis_data),
+    base_model   = model_reduced,
+    full_model   = model_full,
+    r2_base      = r2_base,
+    r2_full      = r2_full,
+    r2_prs       = r2_prs,
+    beta_per_sd  = unname(prs_row["Estimate"]),
+    beta_ci_low  = prs_ci[1],
+    beta_ci_high = prs_ci[2],
+    p_value      = unname(prs_row["Pr(>|t|)"])
+  )
+
+} else if (trait_type == "binary") {
+
+  # Make sure the outcome is binary
+  y <- analysis_data[[outcome_var]]
+
+  if (is.factor(y) || is.character(y)) {
+    analysis_data[[outcome_var]] <- droplevels(as.factor(y))
+    if (nlevels(analysis_data[[outcome_var]]) != 2) {
+      stop("For trait_type = 'binary', the phenotype must have exactly 2 levels.")
+    }
+  } else {
+    uniq_y <- sort(unique(y))
+    if (length(uniq_y) != 2) {
+      stop("For trait_type = 'binary', the phenotype must have exactly 2 values.")
+    }
+    # Recode numeric/logical outcomes to 0/1 using the higher value as the event
+    analysis_data[[outcome_var]] <- ifelse(y == uniq_y[2], 1, 0)
+  }
+
+  # Logistic regression
+  model_reduced <- glm(base_formula, data = analysis_data, family = binomial())
+  model_full    <- glm(full_formula, data = analysis_data, family = binomial())
+
+  # Predicted probabilities
+  prob_base <- predict(model_reduced, type = "response")
+  prob_full <- predict(model_full, type = "response")
+
+  # AUC
+  roc_base <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_base, quiet = TRUE)
+  roc_full <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_full, quiet = TRUE)
+
+  auc_base <- as.numeric(pROC::auc(roc_base))
+  auc_full <- as.numeric(pROC::auc(roc_full))
+  auc_diff <- auc_full - auc_base
+
+  # Nagelkerke R²
+  nag_base <- unname(DescTools::PseudoR2(model_reduced, which = "Nagelkerke"))
+  nag_full <- unname(DescTools::PseudoR2(model_full, which = "Nagelkerke"))
+  nag_diff <- nag_full - nag_base
+
+  # PRS effect per SD
+  prs_row   <- coef(summary(model_full))["PRS_SD", ]
+  log_or    <- unname(prs_row["Estimate"])
+  se_log_or <- unname(prs_row["Std. Error"])
+  p_value   <- unname(prs_row["Pr(>|z|)"])
+
+  or_per_sd <- exp(log_or)
+  or_ci     <- exp(c(log_or - 1.96 * se_log_or, log_or + 1.96 * se_log_or))
+  odds_increase_pct <- (or_per_sd - 1) * 100
+
+  logistic_txt <- glue("
+Base model AUC:               {round(auc_base, 4)}
+Full model AUC:               {round(auc_full, 4)}
+Delta AUC (PRS):              {round(auc_diff, 4)}
+
+Base model Nagelkerke R²:     {round(nag_base, 4)}
+Full model Nagelkerke R²:     {round(nag_full, 4)}
+Delta Nagelkerke R² (PRS):    {round(nag_diff, 4)}
+
+PRS effect per SD:
+  Log-odds beta:              {round(log_or, 4)}
+  OR per SD:                  {round(or_per_sd, 4)}
+  95% CI for OR:              [{round(or_ci[1], 4)}, {round(or_ci[2], 4)}]
+  % increase in odds / SD:    {round(odds_increase_pct, 2)}%
+  P-value:                    {signif(p_value, 4)}
+")
+
+  cat(logistic_txt, "\n")
+  print(summary(model_full))
+
+  results <- list(
+    trait_type         = trait_type,
+    n                  = nrow(analysis_data),
+    base_model         = model_reduced,
+    full_model         = model_full,
+    auc_base           = auc_base,
+    auc_full           = auc_full,
+    auc_diff           = auc_diff,
+    nagelkerke_base    = nag_base,
+    nagelkerke_full    = nag_full,
+    nagelkerke_diff    = nag_diff,
+    log_or_per_sd      = log_or,
+    or_per_sd          = or_per_sd,
+    or_ci_low          = or_ci[1],
+    or_ci_high         = or_ci[2],
+    odds_increase_pct  = odds_increase_pct,
+    p_value            = p_value
+  )
+
+}
+```
+
+

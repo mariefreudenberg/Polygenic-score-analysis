@@ -1,0 +1,78 @@
+---
+title: "PRS"
+output: html_document
+date: "2025-04-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# lad libraries 
+```{r}
+library(readr)
+library(dplyr)
+library(glue)
+library(stringr)
+```
+
+# specify PGS file 
+```{r}
+file <- "PGS003356"
+```
+
+# Calculate PRS using PLINK2 
+```{r}
+system(glue("C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe --pfile R:/Doktoranden/MarieFreudenberg/genetik_LIFE_Adult/LIFE-Adult_TOPMed_minimal_filtered_chr1to23 --score R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_scorefile.txt 1 2 3 header list-variants cols=+scoresums --out R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_output"))
+```
+
+# Standardize scores and save to a seperate file  
+```{r}
+prs <- read_table(glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_output.sscore"))
+prs$SCORE_standardized <- as.numeric(scale(prs$SCORE1_SUM))
+
+prs_out <- prs %>%
+  select(IID, SCORE_standardized)
+
+write_tsv(prs_out, glue("R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS/{file}_output_standardized.tsv"))
+```
+
+# for Smit RAJ et al multiple scores need to be combined 
+```{r}
+base_dir <- "R:/Doktoranden/MarieFreudenberg/analysen/LIFE_PRS"
+
+afr <- fread(file.path(base_dir, "PGS005200_output_standardized.tsv"))
+amr <- fread(file.path(base_dir, "PGS005201_output_standardized.tsv"))
+eas <- fread(file.path(base_dir, "PGS005202_output_standardized.tsv"))
+eur <- fread(file.path(base_dir, "PGS005203_output_standardized.tsv"))
+sas <- fread(file.path(base_dir, "PGS005204_output_standardized.tsv"))
+
+# Rename score column in each file
+setnames(afr, "SCORE_standardized", "zAFR")
+setnames(amr, "SCORE_standardized", "zAMR")
+setnames(eas, "SCORE_standardized", "zEAS")
+setnames(eur, "SCORE_standardized", "zEUR")
+setnames(sas, "SCORE_standardized", "zSAS")
+
+# Merge all files by IID
+combined <- Reduce(
+  function(x, y) merge(x, y, by = "IID"),
+  list(afr, amr, eas, eur, sas)
+)
+
+# Create the EUR LC score from the five standardized component scores
+combined[, SCORE_LC_EUR := 0.16 * zAMR +
+                           (-0.01) * zAFR +
+                            0.14 * zEAS +
+                            1.00 * zEUR +
+                            0.05 * zSAS]
+
+# Standardize the final combined score, keep only IID and score and save 
+combined[, SCORE_standardized := as.numeric(scale(SCORE_LC_EUR))]
+
+out <- combined[, .(IID, SCORE_standardized)]
+
+outfile <- file.path(base_dir, "PGS005203_LC_EUR_output_standardized.tsv")
+fwrite(out, outfile, sep = "\t")
+```
+
