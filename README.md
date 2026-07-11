@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-# Polygenic Risk Score Analysis
-
-This repository contains the R scripts and R Markdown notebooks used for my master's thesis on polygenic risk scores.
-=======
 # Polygenic Risk Score Construction and Evaluation Across Ancestries
 
 # Polygenic Risk Score Transferability and Recalibration
@@ -167,4 +162,3 @@ Utilities for visualizing GWAS summary statistics.
 
 ---
 > Year.
->>>>>>> 7644bbcd680f5f5f402aa543c3a53af6c46657a8
