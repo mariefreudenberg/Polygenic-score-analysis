@@ -1,170 +1,222 @@
 ---
-title: "Boosting"
+title: "snpboost"
 output: html_document
-date: "2025-07-07"
+date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## load libraries 
+# Overview
+
+This notebook fits a polygenic score using `snpboost` and individual-level
+genotype and phenotype data.
+
+The phenotype file is assumed to have already been prepared, as in the other
+analysis scripts.
+
+## Required input
+
+The phenotype file must contain at least:
+
+```text
+IID
+Phenotype
+Age
+Sex
+```
+
+The target genotype dataset must be available in PLINK 2 format:
+
+```text
+genotype_prefix.pgen
+genotype_prefix.pvar
+genotype_prefix.psam
+```
+
+The following snpboost source files are also required and can be downloaded 
+from https://github.com/hklinkhammer/snpboost:
+
+```text
+snpboost.R
+functions_snpboost.R
+functions_snpnet.R
+lm_boost.R
+```
+
+PLINK 2 and `zstdcat` must be installed locally.
+
+# Load libraries
 
 ```{r}
-library(bigsnpr)
-library(data.table)
-library(readxl)
 library(dplyr)
-library(glue)
 library(readr)
-library(pgenlibr)
-library(tidyr)
-library(dataPreparation)
-library(Rfast)
-library(R.utils)
+library(glue)
 ```
 
-## 2. Set trait and base path
+# Set paths and analysis options
+
+Change only the settings in this section.
 
 ```{r}
+# Main project directory
+path_prefix <- "path/to/project"
+
+# Trait name
 trait <- "BMI"
-forostar <- FALSE
 
-base_path <- if (forostar) {
-  "/net/ifs2/san_projekte/projekte/Doktoranden"
-} else {
-  "R:/Doktoranden"
-}
+# Input phenotype and covariate file
+phenotype_file <- file.path(
+  path_prefix,
+  "Phenofiles",
+  paste0(trait, "_covars.tsv")
+)
+
+# PLINK 2 genotype prefix without a file extension
+genotype_prefix <- file.path(
+  path_prefix,
+  "path",
+  "to",
+  "genotype_data"
+)
+
+# Directory containing the snpboost source files
+snpboost_dir <- file.path(
+  path_prefix,
+  "snpboost"
+)
+
+# External executables
+plink2_path <- "path/to/plink2.exe"
+zstdcat_path <- "path/to/zstdcat.exe"
+
+# Output directory
+results_dir <- file.path(
+  path_prefix,
+  "snpboost",
+  "snpboost_results",
+  trait
+)
 ```
 
-## 2. File definitions
+# Read the phenotype file
+
 ```{r}
-trait_info <- list(
-  BMI = list(
-    file = file.path(base_path, "MarieFreudenberg/daten/data/PV0857_D00074_NODUP.xlsx"),
-    id_col = "SIC",
-    pheno_col = "BMI_BMI"
+pheno <- read_tsv(
+  phenotype_file,
+  show_col_types = FALSE
+) %>%
+  select(
+    IID,
+    Phenotype,
+    Age,
+    Sex
+  ) %>%
+  filter(
+    !is.na(IID),
+    !is.na(Phenotype),
+    !is.na(Age),
+    !is.na(Sex)
+  )
+```
+
+# Create training, validation, and test sets
+
+The data are divided into:
+
+- 60% training data;
+- 20% validation data;
+- 20% test data.
+
+```{r}
+set.seed(42)
+
+n <- nrow(pheno)
+idx <- sample(seq_len(n))
+
+train_end <- round(0.6 * n)
+validation_end <- round(0.8 * n)
+
+train_idx <- idx[1:train_end]
+val_idx <- idx[(train_end + 1):validation_end]
+test_idx <- idx[(validation_end + 1):n]
+
+pheno$split <- NA_character_
+pheno$split[train_idx] <- "train"
+pheno$split[val_idx] <- "val"
+pheno$split[test_idx] <- "test"
+```
+
+# Save the snpboost phenotype input file
+
+```{r}
+snpboost_pheno_file <- file.path(
+  snpboost_dir,
+  paste0(trait, "_input.tsv")
+)
+
+write_tsv(
+  pheno,
+  snpboost_pheno_file
+)
+```
+
+# Load the snpboost functions
+
+```{r}
+source(
+  file.path(
+    snpboost_dir,
+    "snpboost.R"
   )
 )
 
-info <- trait_info[[trait]]
-pheno_raw <- read_excel(info$file)
-
-pheno <- pheno_raw %>%
-  select(IID = all_of(info$id_col), Phenotype = all_of(info$pheno_col)) %>%
-  mutate(Phenotype = as.numeric(gsub(",", ".", Phenotype)))
-```
-
-## 3. Combine with metadata
-
-```{r}
-meta <- read_excel(file.path(base_path, "MarieFreudenberg/daten/data/PV0857_D00153_NODUP.xlsx"))
-
-map <- read_excel(file.path(base_path, "MarieFreudenberg/daten/data/PV0857_D00126.xlsx")) %>%
-  select(SIC = ENTNAHME_SIC, IID = ENTNAHME_SAMPLING_ID)
-
-# remove dublicates in map and join with pheno
-map_dedup <- map %>%
-  distinct(SIC, .keep_all = TRUE)
-meta_clean <- meta %>%
-  left_join(map, by = "SIC") %>%
-  select(IID = SIC, Sex = ADULT_PROB_GENDER, Age = ADULT_PROB_AGE) %>%
-  mutate(
-    Age = as.numeric(gsub(",", ".", Age)),
-    Sex = factor(Sex, levels = c(1, 2), labels = c("Male", "Female"))
+source(
+  file.path(
+    snpboost_dir,
+    "functions_snpboost.R"
   )
+)
 
-covariate_data <- pheno %>%
-  left_join(meta_clean, by = "IID") %>%
-  select(IID, Sex, Age, Phenotype) %>%
-  filter(!is.na(Sex), !is.na(Age), !is.na(Phenotype))
+source(
+  file.path(
+    snpboost_dir,
+    "functions_snpnet.R"
+  )
+)
 
-pheno_mapped <- covariate_data %>%
-  rename(SIC = IID) %>%
-  left_join(map_dedup, by = "SIC") %>%
-  select(IID, Sex, Age, Phenotype)
-
-head(pheno_mapped)
+source(
+  file.path(
+    snpboost_dir,
+    "lm_boost.R"
+  )
+)
 ```
 
-## 4. Create train/val/test split
-```{r}
-set.seed(42)
-n <- nrow(pheno_mapped)
-idx <- sample(n)
-train_idx <- idx[1:round(0.6 * n)]
-val_idx   <- idx[(round(0.6 * n) + 1):(round(0.8 * n))]
-test_idx  <- idx[(round(0.8 * n) + 1):n]
-```
+# Fit the snpboost model
 
-```{r}
-pheno_mapped$Sex <- relevel(pheno_mapped$Sex, ref = "Male")
-
-X <- model.matrix(~ Age + Sex, data = pheno_mapped)
-y <- pheno_mapped$Phenotype
-
-X_train <- X[train_idx, ]
-y_train <- y[train_idx]
-
-X_val <- X[val_idx, ]
-y_val <- y[val_idx]
-
-X_test <- X[test_idx, ]
-y_test <- y[test_idx]
-
-G_index_train <- matched_indices[train_idx]
-G_index_val   <- matched_indices[val_idx]
-G_index_test  <- matched_indices[test_idx]
-```
-
-```{r}
-pheno_mapped$split <- NA_character_  # create empty column
-pheno_mapped <- pheno_mapped %>%
-  mutate(FID = IID)
-
-# Standardize the BMI phenotype
-pheno_mapped <- pheno_mapped %>%
-  mutate(
-    BMI_std = as.numeric(scale(Phenotype))  # Standardized phenotype column
-  ) %>%
-  select(FID, IID, Age, Sex, Phenotype, BMI_std, split)
-
-pheno_mapped$split[train_idx] <- "train"
-pheno_mapped$split[val_idx]   <- "val"
-pheno_mapped$split[test_idx]  <- "test"
-pheno_mapped
-```
-```{r}
-write_tsv(pheno_mapped, file = file.path(base_path, "MarieFreudenberg/analysen/Boosting/BMI_input.tsv"))
-```
-
-## 5. Set file paths for other functions
-```{r}
-source(file.path(base_path, "MarieFreudenberg/analysen/Boosting/snpboost.R"))
-source(file.path(base_path, "MarieFreudenberg/analysen/Boosting/functions_snpboost.R"))
-source(file.path(base_path, "MarieFreudenberg/analysen/Boosting/functions_snpnet.R"))
-source(file.path(base_path, "MarieFreudenberg/analysen/Boosting/lm_boost.R"))
-```
-
-## 6. Fit snpboost model (adjust data paths and make sure to download plink2 and zdstcat)
 ```{r}
 prs_model <- snpboost(
-  genotype.pfile = file.path(base_path, "MarieFreudenberg/analysen/Boosting/LIFE-Adult_TOPMed_strict_qc"),
-  phenotype.file = file.path(base_path, "MarieFreudenberg/analysen/Boosting/BMI_input.tsv"),
+  genotype.pfile = genotype_prefix,
+  phenotype.file = snpboost_pheno_file,
   phenotype = "Phenotype",
-  covariates = c("Age", "Sex"),
+  covariates = c(
+    "Age",
+    "Sex"
+  ),
   split.col = "split",
-  family = "gaussian",          # for continuous trait
+  family = "gaussian",
   metric = "MSEP",
   p_batch = 1000,
   m_batch = 1000,
   b_stop = 1,
-  sl = 0.01,                      # learning rate
+  sl = 0.01,
   configs = list(
-    plink2.path = "C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe",
-    zstdcat.path = "C:/Users/mar5862fre/Downloads/plink2_win64_20251026/zstdcat.exe",
+    plink2.path = plink2_path,
+    zstdcat.path = zstdcat_path,
     nCores = parallel::detectCores() - 1,
-    results.dir = file.path(base_path, "MarieFreudenberg/analysen/Boosting/snpboost_results"),
+    results.dir = results_dir,
     meta.dir = "meta",
     save.dir = "results",
     save = TRUE,
@@ -172,305 +224,3 @@ prs_model <- snpboost(
   )
 )
 ```
-# look at model
-```{r}
-str(prs_model, max.level = 1)
-```
-```{r}
-betas_final <- get_coefficients(
-  coeff_path = prs_model$beta,
-  index = which.min(prs_model$metric.val),                 # or last iteration
-  covariates = prs_model$configs[['covariates']]
-)
-print(betas_final)
-```
-```{r}
-# Convert betas to a data frame
-beta_df <- data.frame(
-  Predictor = names(betas_final),
-  Beta = as.numeric(betas_final),
-  row.names = NULL
-)
-
-# Write TSV
-write.table(
-  beta_df,
-  file = "strictqc_betas.tsv",
-  sep = "\t",
-  quote = FALSE,
-  row.names = FALSE
-)
-```
-
-
-
-# Predict test scores 
-```{r}
-# 1) Paths & names
-genotype.pfile <- file.path(base_path, "MarieFreudenberg/analysen/Boosting/LIFE-Adult_TOPMed_strict_qc")
-phenotype.file <- file.path(base_path, "MarieFreudenberg/analysen/Boosting/BMI_input.tsv")
-phenotype      <- "Phenotype"          # column name in the TSV
-subset_name    <- "test"               # matches values in configs[['split.col']] (e.g., 'train_test')
-
-# 2) Predict PRS-only and PRS+covariates on TEST using your helper
-pred_test <- predict_snpboost(
-  fit               = prs_model,
-  new_genotype_file = genotype.pfile,
-  new_phenotype_file= phenotype.file,
-  phenotype         = phenotype,
-  subset            = subset_name
-)
-```
-
-```{r}
-library(ggplot2)
-
-# 1) Predict on ALL samples (needed for GLM refits) + on TEST (optional)
-pred_all <- predict_snpboost(
-  fit                = prs_model,
-  new_genotype_file  = genotype.pfile,
-  new_phenotype_file = phenotype.file,
-  phenotype          = phenotype
-)
-
-pred_test <- predict_snpboost(
-  fit                = prs_model,
-  new_genotype_file  = genotype.pfile,
-  new_phenotype_file = phenotype.file,
-  phenotype          = phenotype,
-  subset             = subset_name
-)
-
-# 2) Build a clean data.table with phenotype, PRS, covariates, and split
-cfg       <- prs_model$configs
-split_col <- cfg[['split.col']]
-covars    <- cfg[['covariates']]
-
-phe <- fread(phenotype.file)
-phe[, IID := as.character(IID)]
-
-# Grab PRS from pred_all (named vector) and merge
-prs_dt <- data.table(IID = names(pred_all$PRS), PRS = as.numeric(pred_all$PRS))
-dat <- merge(phe, prs_dt, by = "IID", all.x = TRUE)
-
-# Recode Sex like in training (Female=1, Male=0) if needed
-if ("Sex" %in% names(dat) && is.character(dat$Sex)) {
-  dat[, Sex := ifelse(Sex == "Female", 1, 0)]
-}
-
-# If any PRS missing (e.g., no matching variants), set to 0 so rows aren’t dropped
-dat[is.na(PRS), PRS := 0]
-
-# Keep rows with phenotype and defined split
-dat <- dat[!is.na(get(phenotype)) & !is.na(get(split_col))]
-
-train_val <- dat[get(split_col) %in% c("train","val")]
-test      <- dat[get(split_col) == subset_name]
-
-# Helpers
-rmse <- function(y, yhat) sqrt(mean((y - yhat)^2))
-r2   <- function(y, yhat) if (length(yhat) > 1) cor(y, yhat)^2 else NA_real_
-
-# 3) Refit three GLMs on train+val and evaluate on test
-
-## (a) PRS-only
-lm_prs <- lm(reformulate(termlabels = "scale(PRS)", response = phenotype), data = train_val)
-pred_prs <- predict(lm_prs, newdata = test)
-rmse_prs <- rmse(test[[phenotype]], pred_prs)
-r2_prs   <- r2(test[[phenotype]], pred_prs)
-
-## (b) Covariates-only
-if (length(covars) > 0) {
-  f_cov <- reformulate(termlabels = covars, response = phenotype)  # phenotype ~ covars
-} else {
-  f_cov <- as.formula(paste0(phenotype, " ~ 1"))                    # intercept-only fallback
-}
-lm_cov <- lm(f_cov, data = train_val)
-pred_cov <- predict(lm_cov, newdata = test)
-rmse_cov <- rmse(test[[phenotype]], pred_cov)
-r2_cov   <- r2(test[[phenotype]], pred_cov)
-
-## (c) Full: PRS + covariates
-if (length(covars) > 0) {
-  f_full <- as.formula(paste0(phenotype, " ~ scale(PRS) + ", paste(covars, collapse = " + ")))
-} else {
-  f_full <- as.formula(paste0(phenotype, " ~ scale(PRS)"))
-}
-lm_full <- lm(f_full, data = train_val)
-pred_full <- predict(lm_full, newdata = test)
-rmse_full <- rmse(test[[phenotype]], pred_full)
-r2_full   <- r2(test[[phenotype]], pred_full)
-
-# 4) Report
-res_tab <- data.frame(
-  Model = c("PRS only", "Covariates only", "PRS + Covariates"),
-  RMSE  = c(rmse_prs, rmse_cov, rmse_full),
-  R2    = c(r2_prs, r2_cov, r2_full)
-)
-print(res_tab, row.names = FALSE)
-
-# 5) Plot: Measured vs Predicted (full model)
-p <- ggplot(data.frame(y = test[[phenotype]], yhat = pred_full), aes(x = yhat, y = y)) +
-  geom_point(alpha = 0.35, size = 1) +
-  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
-  labs(title = "Predicted vs Measured BMI (Full Model)",
-       x = "Predicted BMI", y = "Measured BMI") +
-  annotate("text",
-           x = min(pred_full, na.rm = TRUE),
-           y = max(test[[phenotype]], na.rm = TRUE),
-           hjust = 0, vjust = 1,
-           label = sprintf("RMSE = %.3f\nR² = %.4f", rmse_full, r2_full))
-print(p)
-
-```
-
-```{r}
-predict_snpboost <- function(
-  fit,
-  new_genotype_file,         # PLINK2 pfile prefix (no extension)
-  new_phenotype_file,        # TSV with IID, phenotype, covariates, split.col
-  phenotype,                 # column name of phenotype in TSV
-  subset = NULL,             # e.g. "test" (value in fit$configs[['split.col']])
-  idx = NULL,                # optional: index of best iteration; else auto-picked
-  out_prefix = "PRS",        # basename for plink --out in results.dir
-  return_all = TRUE          # return merged eval table
-){
-  require(data.table)
-  `%||%` <- function(a,b) if (is.null(a)) b else a
-
-  # ---- 0) configs & paths ----
-  cfg <- fit$configs
-  stopifnot(!is.null(cfg[['plink2.path']]))
-  results.dir <- cfg[['results.dir']] %||% tempdir(check = TRUE)
-  dir.create(results.dir, showWarnings = FALSE, recursive = TRUE)
-
-  # ---- 1) choose model index ----
-  if (is.null(idx)) {
-    idx <- if (!is.null(fit$metric.val)) which.min(fit$metric.val) else which.min(fit$metric.train)
-  }
-
-  # ---- 2) collect coefficients at idx ----
-  # names: (Intercept), covariates..., SNP names...
-  betas <- get_coefficients(fit$beta, index = idx, covariates = cfg[['covariates']])
-  # separate
-  beta0 <- unname(betas[["(Intercept)"]])
-  covars <- cfg[['covariates']] %||% character(0)
-  beta_cov <- if (length(covars)) betas[covars] else numeric(0)
-  beta_snps <- betas[setdiff(names(betas), c("(Intercept)", covars))]
-
-  # short-circuit: if no SNPs selected, still predict (intercept + covariates only)
-  if (length(beta_snps) == 0L) {
-    phe <- fread(new_phenotype_file)
-    if (!is.null(subset)) phe <- phe[phe[[cfg[['split.col']]]] == subset, ]
-    # optional Sex recode for consistency
-    if ("Sex" %in% covars && is.character(phe$Sex)) {
-      phe[, Sex := ifelse(Sex == "Female", 1, 0)]
-    }
-    Xcov <- if (length(covars)) as.matrix(phe[, ..covars]) else matrix(0, nrow(phe), 0)
-    pred <- as.numeric(beta0 + if (length(covars)) Xcov %*% beta_cov else 0)
-    resid <- phe[[phenotype]] - pred
-    mse   <- mean((resid)^2, na.rm = TRUE)
-    out <- list(
-      idx = idx,
-      betas = betas,
-      PRS = setNames(rep(0, nrow(phe)), phe$IID),
-      prediction = matrix(pred, ncol = 1, dimnames = list(phe$IID, "pred")),
-      residuals = matrix(resid, ncol = 1, dimnames = list(phe$IID, "resid")),
-      metric = mse,
-      RMSE = sqrt(mse),
-      R2 = cor(phe[[phenotype]], pred)^2,
-      eval = if (return_all) data.table(IID = phe$IID, y = phe[[phenotype]], pred = pred, PRS = 0) else NULL
-    )
-    return(out)
-  }
-
-  # ---- 3) build PLINK score file (ID, ALLELE, BETA) ----
-  # Your SNP names look like "chr13:33921449:C:T_T". Often the last underscore suffix is the effect allele.
-  split_last_underscore <- function(s) {
-    p <- regexpr("_(?!.*_)", s, perl = TRUE)  # last "_"
-    if (p[1] == -1) return(c(s, ""))          # no underscore
-    c(substr(s, 1, p[1]-1), substr(s, p[1]+1, nchar(s)))
-  }
-  # Use your split_last() if it exists
-  if (exists("split_last")) splitter <- split_last else splitter <- function(x, pattern="_") split_last_underscore(x)
-
-  var_names <- names(beta_snps)
-  split_mat <- t(vapply(var_names, function(v) splitter(v, "_"), FUN.VALUE = c("", "")))
-  score_df  <- data.table(ID = split_mat[,1],
-                          ALLELE = split_mat[,2],
-                          BETA = as.numeric(beta_snps))
-  score_path <- file.path(results.dir, paste0(out_prefix, "_scorefile.txt"))
-  fwrite(score_df, score_path, sep = "\t", col.names = TRUE)
-
-  # ---- 4) run plink2 --score ----
-  sscore_prefix <- file.path(results.dir, out_prefix)
-  cmd <- paste(
-    shQuote(cfg[['plink2.path']]),
-    "--threads", cfg[['nCores']] %||% 1,
-    "--pfile", shQuote(new_genotype_file),
-    if (isTRUE(cfg[['vzs']])) "vzs" else "",
-    "--score", shQuote(score_path), 1, 2, 3, "header",
-    "cols=maybefid,denom,dosagesum,scoreavgs,scoresums",
-    "--out", shQuote(sscore_prefix)
-  )
-  cat("PLINK2 --score:\n", cmd, "\n")
-  system(cmd, intern = FALSE, wait = TRUE)
-
-  # read PRS
-  sscore_file <- paste0(sscore_prefix, ".sscore")
-  stopifnot(file.exists(sscore_file))
-  sscore <- fread(sscore_file)
-  # plink names can vary; SCORE1_SUM is typical:
-  prs_col <- intersect(colnames(sscore), c("SCORE1_SUM", "SCORE_AVG", "SCORE1_AVG", "SCORE_SUM"))
-  stopifnot(length(prs_col) >= 1)
-  setnames(sscore, prs_col[1], "PRS")
-  # keep IID
-  if (!"IID" %in% names(sscore) && "IID" %in% names(sscore[, .(IID = as.character(IID))])) {
-    # noop; defensive
-  }
-  prs_dt <- sscore[, .(IID = as.character(IID), PRS = as.numeric(PRS))]
-
-  # ---- 5) join phenotype & covariates; compute final predictions ----
-  phe <- fread(new_phenotype_file)
-  phe[, IID := as.character(IID)]
-  if (!is.null(subset)) phe <- phe[phe[[cfg[['split.col']]]] == subset, ]
-  dat <- merge(phe, prs_dt, by = "IID", all.x = TRUE)
-
-  # convert Sex string to numeric like in training (Female = 1, Male = 0)
-  if ("Sex" %in% covars && is.character(dat$Sex)) {
-    dat[, Sex := ifelse(Sex == "Female", 1, 0)]
-  }
-
-  # any missing PRS -> 0 (e.g., monomorphic or no matching variants)
-  dat[is.na(PRS), PRS := 0]
-
-  Xcov <- if (length(covars)) as.matrix(dat[, ..covars]) else matrix(0, nrow(dat), 0)
-  pred <- as.numeric(beta0 + dat$PRS + if (length(covars)) Xcov %*% beta_cov else 0)
-
-  # ---- 6) metrics on provided subset ----
-  stopifnot(phenotype %in% names(dat))
-  y   <- dat[[phenotype]]
-  ok  <- is.finite(y) & is.finite(pred)
-  mse <- mean((y[ok] - pred[ok])^2)
-  rmse <- sqrt(mse)
-  r2   <- if (sum(ok) > 1) cor(y[ok], pred[ok])^2 else NA_real_
-
-  # ---- 7) outputs ----
-  out <- list(
-    idx = idx,
-    betas = betas,
-    PRS = setNames(dat$PRS, dat$IID),
-    prediction = matrix(pred, ncol = 1, dimnames = list(dat$IID, "pred")),
-    residuals = matrix(y - pred, ncol = 1, dimnames = list(dat$IID, "resid")),
-    metric = mse,            # MSE
-    RMSE = rmse,
-    R2 = r2,
-    eval = if (return_all) data.table(IID = dat$IID, y = y, pred = pred, PRS = dat$PRS) else NULL,
-    scorefile = score_path,
-    sscore = sscore_file
-  )
-  return(out)
-}
-
-```
-

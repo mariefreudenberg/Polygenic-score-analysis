@@ -1,16 +1,39 @@
 ---
-title: "Untitled"
+title: "PRS-CS"
 output: html_document
-date: "2025-05-14"
+date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# load libraries and define base path 
+# Overview
+
+This notebook prepares GWAS summary statistics and target genotype data for
+PRS-CS, runs PRS-CS, combines the chromosome-specific effect files, and
+calculates individual polygenic scores with PLINK 2.
+
+PRS-CS is available from:
+
+<https://github.com/getian107/PRScs>
+
+## Required input
+
+- GWAS summary statistics containing chromosome, position, alleles, effect
+  estimate, p-value, and hg19 coordinates.
+- A target genotype dataset in PLINK BED format:
+  `.bed`, `.bim`, and `.fam`.
+- A phenotype and covariate file containing:
+  `IID`, `Phenotype`, `Age`, `Sex`, and `PC1` to `PC10`.
+- The PRS-CS source code downloaded from the official repository.
+- A PRS-CS LD reference panel downloaded through the official repository.
+- Python with the required PRS-CS dependencies.
+- PLINK 2.
+
+# Load libraries
+
 ```{r}
-.libPaths("H:/Rlibs")
 library(data.table)
 library(readr)
 library(dplyr)
@@ -19,41 +42,113 @@ library(pROC)
 library(DescTools)
 ```
 
-# Read summary statistics file
+# Set paths and analysis options
+
+Change only the settings in this section.
+
 ```{r}
+# Main project directory
+path_prefix <- "path/to/project"
+
 trait <- "Diabetes"
 study <- "Mahajan.NatGenet2018b.T2D.European"
-trait_type <- "binary"   # "continuous" or "binary"
+trait_type <- "binary"  # "continuous" or "binary"
 
-base_path <- glue("R:/Doktoranden/MarieFreudenberg/analysen/CS/{trait}/")
-ss <- fread(file.path(glue("R:/Doktoranden/MarieFreudenberg/analysen/sumstats/{study}.tsv")))
+# GWAS sample size used by PRS-CS
+n_gwas <- 900000
+
+# Executables and software
+plink2_path <- "path/to/plink2.exe"
+python_path <- "python"
+
+# PRS-CS repository directory
+prscs_dir <- file.path(
+  path_prefix,
+  "PRScs"
+)
+
+# PRS-CS LD reference directory
+ld_reference_dir <- file.path(
+  path_prefix,
+  "PRS_CS",
+  "ldblk_1kg_eur"
+)
+
+# SNP information file from the selected reference panel
+reference_snpinfo_file <- file.path(
+  ld_reference_dir,
+  "snpinfo_1kg_hm3"
+)
+
+# Input files
+sumstats_file <- file.path(
+  path_prefix,
+  "sumstats",
+  paste0(study, ".tsv")
+)
+
+genotype_prefix <- file.path(
+  path_prefix,
+  "PRS_CS",
+  "LIFE_bed"
+)
+
+phenotype_file <- file.path(
+  path_prefix,
+  "Phenofiles",
+  paste0(trait, "_covars.tsv")
+)
+
+# Analysis output directory
+base_path <- file.path(
+  path_prefix,
+  "PRS_CS",
+  trait
+)
+
+dir.create(
+  base_path,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+# Read summary statistics
+
+```{r}
+ss <- fread(sumstats_file)
+
 head(ss)
 ```
-# LD ref basepair positions are in hg19 
-# If needed, add rsid to the sumstats ()
-```{r}
-ref <- fread("R:/Doktoranden/MarieFreudenberg/analysen/CS/ldblk_ukbb_eur/snpinfo_ukbb_hm3")
 
-# Standardize columns
+# If needed, add rsIDs using the PRS-CS reference panel
+
+The PRS-CS LD reference positions are in hg19. The summary statistics are
+therefore matched to the reference using hg19 chromosome, position, and
+alleles.
+
+```{r}
+ref <- fread(reference_snpinfo_file)
+
 ss[, `:=`(
-  chr38 = sub("^chr", "", as.character(chr)),          # original hg38 chr
-  pos38 = as.integer(pos),                             # original hg38 pos
-  chr19 = sub("^chr", "", as.character(chr_hg19)),     # lifted hg19 chr
-  pos19 = as.integer(pos_hg19),                        # lifted hg19 pos  <- use this, not start_hg19
-  a1    = toupper(a1),
-  a0    = toupper(a0),
-  beta  = as.numeric(beta),
-  p     = as.numeric(p)
+  chr38 = sub("^chr", "", as.character(chr)),
+  pos38 = as.integer(pos),
+  chr19 = sub("^chr", "", as.character(chr_hg19)),
+  pos19 = as.integer(pos_hg19),
+  a1 = toupper(a1),
+  a0 = toupper(a0),
+  beta = as.numeric(beta),
+  p = as.numeric(p)
 )]
 
 ref[, `:=`(
   chr19 = sub("^chr", "", as.character(CHR)),
   pos19 = as.integer(BP),
-  A1    = toupper(A1),
-  A2    = toupper(A2)
+  A1 = toupper(A1),
+  A2 = toupper(A2)
 )]
 
-# Order-independent allele keys
+# Create order-independent allele keys
 ss[, `:=`(
   allele1 = pmin(a1, a0),
   allele2 = pmax(a1, a0)
@@ -64,59 +159,104 @@ ref[, `:=`(
   allele2 = pmax(A1, A2)
 )]
 
-# Keep only needed reference columns and remove duplicates
+# Keep the required reference columns
 ref_map <- unique(
-  ref[, .(chr19, pos19, allele1, allele2, SNP)]
+  ref[, .(
+    chr19,
+    pos19,
+    allele1,
+    allele2,
+    rsid = SNP
+  )]
 )
 
-# Merge rsID onto sumstats using hg19 coordinates
-ss_annot <- merge(
+# Add rsIDs to the summary statistics
+ss <- merge(
   ss,
   ref_map,
-  by = c("chr19", "pos19", "allele1", "allele2"),
+  by = c(
+    "chr19",
+    "pos19",
+    "allele1",
+    "allele2"
+  ),
   all.x = TRUE
 )
 
-# Keep only variants that got an rsID
-ss <- ss_annot[!is.na(SNP) & SNP != ""]
+# Retain variants that received an rsID
+ss <- ss[
+  !is.na(rsid) &
+    rsid != ""
+]
 
-cat("Number of sumstats variants with rsID:", nrow(ss), "\n")
+cat(
+  "Number of summary-statistic variants with rsID:",
+  nrow(ss),
+  "\n"
+)
+
 head(ss)
 ```
 
-# sumstats need to have: SNP, A1, A2, BETA, SE (or P instead of SE)
+# Create the PRS-CS summary-statistics file
+
+PRS-CS accepts `BETA` and `P` together with the SNP and allele columns.
+
 ```{r}
 prscs_ss <- ss[
-  !is.na(rsid) & !is.na(beta) & !is.na(p),
+  !is.na(rsid) &
+    !is.na(beta) &
+    !is.na(p),
   .(
-    SNP  = rsid,
-    A1   = a1,
-    A2   = a0,
+    SNP = rsid,
+    A1 = a1,
+    A2 = a0,
     BETA = beta,
-    P    = p
+    P = p
   )
 ]
 
+prscs_sumstats_file <- file.path(
+  base_path,
+  paste0(study, "_PRScs.txt")
+)
+
 fwrite(
   prscs_ss,
-  file = file.path(base_path, glue("{study}_PRScs.txt")),
+  file = prscs_sumstats_file,
   sep = "\t",
   quote = FALSE,
   na = "NA"
 )
 ```
 
-# Add rsid to LIFE-Adult bim files(use rsid from the sumstats - keep only snps from sumstats)
-```{r}
-bim <- fread("R:/Doktoranden/MarieFreudenberg/analysen/CS/LIFE_bed.bim")
-setnames(bim, c("CHR", "SNP_old", "CM", "POS", "A1", "A2"))
+# Add rsIDs to the target BIM file
 
-# make join columns consistent immediately
+The target genotype data are restricted to variants present in the summary
+statistics and renamed to the corresponding rsIDs.
+
+```{r}
+bim <- fread(
+  paste0(genotype_prefix, ".bim")
+)
+
+setnames(
+  bim,
+  c(
+    "CHR",
+    "SNP_old",
+    "CM",
+    "POS",
+    "A1",
+    "A2"
+  )
+)
+
 bim[, `:=`(
   CHR = as.character(CHR),
   POS = as.integer(POS),
-  A1  = toupper(A1),
-  A2  = toupper(A2)
+  A1 = toupper(A1),
+  A2 = toupper(A2)
 )]
 
 bim[, `:=`(
@@ -126,28 +266,51 @@ bim[, `:=`(
 
 ss_map <- unique(
   ss[
-    !is.na(rsid) & !is.na(chr) & !is.na(pos),
+    !is.na(rsid) &
+      !is.na(chr) &
+      !is.na(pos),
     .(
       CHR = as.character(chr),
       POS = as.integer(pos),
-      allele1 = as.character(a1),
-      allele2 = as.character(a0),
+      allele1 = pmin(a1, a0),
+      allele2 = pmax(a1, a0),
       rsid = rsid
     )
   ]
 )
 
 map <- merge(
-  bim[, .(CHR, POS, allele1, allele2, SNP_old)],
+  bim[, .(
+    CHR,
+    POS,
+    allele1,
+    allele2,
+    SNP_old
+  )],
   ss_map,
-  by = c("CHR", "POS", "allele1", "allele2")
+  by = c(
+    "CHR",
+    "POS",
+    "allele1",
+    "allele2"
+  )
 )
 
-renamer <- unique(map[, .(oldID = SNP_old, newID = rsid)])
+renamer <- unique(
+  map[, .(
+    oldID = SNP_old,
+    newID = rsid
+  )]
+)
+
+rename_file <- file.path(
+  base_path,
+  paste0(study, "_rename_to_rsid.txt")
+)
 
 fwrite(
   renamer,
-  file = file.path(base_path, glue("{study}_rename_to_rsid.txt")),
+  file = rename_file,
   sep = "\t",
   col.names = FALSE,
   quote = FALSE
@@ -155,274 +318,248 @@ fwrite(
 
 keep_snps_new <- unique(map$rsid)
 
+extract_file <- file.path(
+  base_path,
+  paste0(study, "_rsid.txt")
+)
+
 fwrite(
   data.table(SNP = keep_snps_new),
-  file = file.path(base_path, glue("{study}_rsid.txt")),
+  file = extract_file,
   sep = "\t",
   col.names = FALSE,
   quote = FALSE
 )
 ```
 
+# Create the target genotype files for PRS-CS
+
 ```{r}
-extract_file <- glue("{base_path}/{study}_rsid.txt")
-rename_file  <- glue("{base_path}/{study}_rename_to_rsid.txt")
-out_prefix   <- glue("{base_path}/{study}_LIFE_rsid")
+out_prefix <- file.path(
+  base_path,
+  paste0(study, "_LIFE_rsid")
+)
 
 cmd <- paste(
-  shQuote("C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe"),
-  "--bfile", shQuote("R:/Doktoranden/MarieFreudenberg/analysen/CS/LIFE_bed"),
-  "--extract", shQuote(extract_file),
-  "--update-name", shQuote(rename_file), "2", "1",
+  shQuote(plink2_path),
+  "--bfile",
+  shQuote(genotype_prefix),
+  "--extract",
+  shQuote(extract_file),
+  "--update-name",
+  shQuote(rename_file),
+  "2",
+  "1",
   "--make-bed",
-  "--out", shQuote(out_prefix)
+  "--out",
+  shQuote(out_prefix)
 )
 
 cat("Running:\n", cmd, "\n")
+
 system(cmd)
 ```
 
-# run this command in python in PRScs-master directory 
-# python PRScs.py --ref_dir=PATH_TO_REFERENCE --bim_prefix=VALIDATION_BIM_PREFIX --sst_file=SUM_STATS_FILE --n_gwas=GWAS_SAMPLE_SIZE --out_dir=OUTPUT_DIR [--a=PARAM_A --b=PARAM_B --phi=PARAM_PHI --n_iter=MCMC_ITERATIONS --n_burnin=MCMC_BURNIN --thin=MCMC_THINNING_FACTOR --chrom=CHROM --beta_std=BETA_STD --write_psi=WRITE_PSI --write_pst=WRITE_POSTERIOR_SAMPLES --seed=SEED]
+# Run PRS-CS
 
-# print full command (manually adjust GWAS sample size)
+The command is printed here and can be run from the PRS-CS repository
+directory.
+
 ```{r}
-bim_prefix <- out_prefix
-sst_file   <- glue("{base_path}/{study}_PRScs.txt")
-out_dir    <- glue("{base_path}/{study}_prscs")
+prscs_output_prefix <- file.path(
+  base_path,
+  paste0(study, "_prscs")
+)
+
+prscs_script <- file.path(
+  prscs_dir,
+  "PRScs.py"
+)
 
 cmd <- paste(
-  "python PRScs.py",
-  paste0("--ref_dir=", shQuote("R:/Doktoranden/MarieFreudenberg/analysen/CS/ldblk_1kg_eur")),
-  paste0("--bim_prefix=", shQuote(bim_prefix)),
-  paste0("--sst_file=", shQuote(sst_file)),
-  "--n_gwas=900000",
-  paste0("--out_dir=", shQuote(out_dir)),
+  shQuote(python_path),
+  shQuote(prscs_script),
+  paste0(
+    "--ref_dir=",
+    shQuote(ld_reference_dir)
+  ),
+  paste0(
+    "--bim_prefix=",
+    shQuote(out_prefix)
+  ),
+  paste0(
+    "--sst_file=",
+    shQuote(prscs_sumstats_file)
+  ),
+  paste0(
+    "--n_gwas=",
+    n_gwas
+  ),
+  paste0(
+    "--out_dir=",
+    shQuote(prscs_output_prefix)
+  ),
   "--seed=1234"
 )
 
 cat(cmd, "\n")
 ```
 
-# concatenate the 22 chr files into one big file and loose the columns that are not neccesary to score 
+# Combine the chromosome-specific PRS-CS output files
+
+Run this section after the PRS-CS command has finished.
+
 ```{r}
-# Find all PRS-CS effect files and stack them 
 files <- list.files(
   path = base_path,
-  pattern = paste0("^", study, "_prscs_pst_eff"),
+  pattern = paste0(
+    "^",
+    study,
+    "_prscs_pst_eff"
+  ),
   full.names = TRUE
 )
 
-length(files)        # should be 22
-files[1:5]
+length(files)
 
-allchr <- rbindlist(lapply(files, fread))
+allchr <- rbindlist(
+  lapply(
+    files,
+    fread
+  )
+)
 
-# Rename columns for clarity
-setnames(allchr, c("CHR", "SNP", "BP", "A1", "A2", "BETA"))
+setnames(
+  allchr,
+  c(
+    "CHR",
+    "SNP",
+    "BP",
+    "A1",
+    "A2",
+    "BETA"
+  )
+)
+```
 
-# Check overlap with BIM
-bim <- fread(file.path(glue(base_path, "{study}_LIFE_rsid.bim")))
-setnames(bim, c("CHR", "SNP", "CM", "BP", "A1", "A2"))
+# Check overlap with the target BIM file
 
-cat("Score SNPs:", length(unique(allchr$SNP)), "\n")
-cat("BIM SNPs:  ", length(unique(bim$SNP)), "\n")
-cat("Overlap:   ", length(intersect(allchr$SNP, bim$SNP)), "\n")
+```{r}
+bim <- fread(
+  paste0(out_prefix, ".bim")
+)
 
-# Create simple 3-column score file
-score <- allchr[, .(SNP, A1, BETA)]
+setnames(
+  bim,
+  c(
+    "CHR",
+    "SNP",
+    "CM",
+    "BP",
+    "A1",
+    "A2"
+  )
+)
+
+cat(
+  "Score SNPs:",
+  length(unique(allchr$SNP)),
+  "\n"
+)
+
+cat(
+  "BIM SNPs:",
+  length(unique(bim$SNP)),
+  "\n"
+)
+
+cat(
+  "Overlap:",
+  length(
+    intersect(
+      allchr$SNP,
+      bim$SNP
+    )
+  ),
+  "\n"
+)
+```
+
+# Create the PRS-CS score file
+
+```{r}
+score <- allchr[
+  ,
+  .(
+    SNP,
+    A1,
+    BETA
+  )
+]
+
+score_file <- file.path(
+  base_path,
+  paste0(
+    study,
+    "_prscs_scorefile.txt"
+  )
+)
 
 fwrite(
   score,
-  file = file.path(glue(base_path, "{study}_prscs_scorefile.txt")),
+  file = score_file,
   sep = "\t"
 )
 ```
 
-# score LIFE data
+# Calculate individual scores with PLINK 2
+
 ```{r}
-score_file <- file.path(base_path, glue("{study}_prscs_scorefile.txt"))
-out_file   <- file.path(base_path, glue("{study}_individual_scores"))
+individual_score_prefix <- file.path(
+  base_path,
+  paste0(
+    study,
+    "_individual_scores"
+  )
+)
 
 cmd <- paste(
-  shQuote("C:/Users/mar5862fre/Downloads/plink2_win64_20251026/plink2.exe"),
-  "--bfile", shQuote(out_prefix),
-  "--score", shQuote(score_file),
+  shQuote(plink2_path),
+  "--bfile",
+  shQuote(out_prefix),
+  "--score",
+  shQuote(score_file),
   "1 2 3 header-read cols=+scoresums",
-  "--out", shQuote(out_file)
+  "--out",
+  shQuote(individual_score_prefix)
 )
 
 cat(cmd, "\n")
+
 system(cmd)
 ```
 
-# Create file with phenotype, metadata and prs scores 
-# load files 
+# Merge the PRS with the phenotype file
+
 ```{r}
-data <- fread(glue("R:/Doktoranden/MarieFreudenberg/analysen/Phenofiles/{trait}_covars.tsv"))
-prs <- read_table(glue(base_path, "{study}_individual_scores.sscore"))
-```
-# Add PRS to covars data
-```{r}
+data <- fread(
+  phenotype_file
+)
+
+prs <- read_table(
+  paste0(
+    individual_score_prefix,
+    ".sscore"
+  )
+)
+
 data <- data %>%
-  left_join(prs, by = "IID")
-data <- data[complete.cases(data), ]
-```
-
-# Run linear/logistic regression and check how much variance is explained by PRS
-```{r}
-outcome_var <- "Phenotype"
-prs_var     <- "BETA_SUM"
-covars      <- c("Age", "Sex", paste0("PC", 1:10))
-
-analysis_vars <- c(outcome_var, prs_var, covars)
-
-analysis_data <- as.data.frame(data[, ..analysis_vars])
-analysis_data <- analysis_data[complete.cases(analysis_data), ]
-
-analysis_data$PRS_SD <- as.numeric(scale(analysis_data[[prs_var]]))
-
-base_formula <- as.formula(
-  paste(outcome_var, "~", paste(covars, collapse = " + "))
-)
-
-full_formula <- as.formula(
-  paste(outcome_var, "~", paste(c("PRS_SD", covars), collapse = " + "))
-)
-
-trait_type <- tolower(trait_type)
-
-if (trait_type == "continuous") {
-
-  # Linear regression
-  model_reduced <- lm(base_formula, data = analysis_data)
-  model_full    <- lm(full_formula, data = analysis_data)
-
-  r2_base <- summary(model_reduced)$r.squared
-  r2_full <- summary(model_full)$r.squared
-  r2_prs  <- r2_full - r2_base
-
-  prs_row <- coef(summary(model_full))["PRS_SD", ]
-  prs_ci  <- confint(model_full, "PRS_SD")
-
-  var_explained_txt <- glue("
-Base model R²:                {round(r2_base, 4)}
-Full model R²:                {round(r2_full, 4)}
-Incremental R² (PRS):         {round(r2_prs, 4)}
-
-PRS effect per SD:
-  Beta:                       {round(unname(prs_row['Estimate']), 4)}
-  95% CI:                     [{round(prs_ci[1], 4)}, {round(prs_ci[2], 4)}]
-  P-value:                    {signif(unname(prs_row['Pr(>|t|)']), 4)}
-")
-
-  cat(var_explained_txt, "\n")
-  print(summary(model_full))
-
-  results <- list(
-    trait_type   = trait_type,
-    n            = nrow(analysis_data),
-    base_model   = model_reduced,
-    full_model   = model_full,
-    r2_base      = r2_base,
-    r2_full      = r2_full,
-    r2_prs       = r2_prs,
-    beta_per_sd  = unname(prs_row["Estimate"]),
-    beta_ci_low  = prs_ci[1],
-    beta_ci_high = prs_ci[2],
-    p_value      = unname(prs_row["Pr(>|t|)"])
+  left_join(
+    prs,
+    by = "IID"
   )
 
-} else if (trait_type == "binary") {
-
-  # Make sure the outcome is binary
-  y <- analysis_data[[outcome_var]]
-
-  if (is.factor(y) || is.character(y)) {
-    analysis_data[[outcome_var]] <- droplevels(as.factor(y))
-    if (nlevels(analysis_data[[outcome_var]]) != 2) {
-      stop("For trait_type = 'binary', the phenotype must have exactly 2 levels.")
-    }
-  } else {
-    uniq_y <- sort(unique(y))
-    if (length(uniq_y) != 2) {
-      stop("For trait_type = 'binary', the phenotype must have exactly 2 values.")
-    }
-    # Recode numeric/logical outcomes to 0/1 using the higher value as the event
-    analysis_data[[outcome_var]] <- ifelse(y == uniq_y[2], 1, 0)
-  }
-
-  # Logistic regression
-  model_reduced <- glm(base_formula, data = analysis_data, family = binomial())
-  model_full    <- glm(full_formula, data = analysis_data, family = binomial())
-
-  # Predicted probabilities
-  prob_base <- predict(model_reduced, type = "response")
-  prob_full <- predict(model_full, type = "response")
-
-  # AUC
-  roc_base <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_base, quiet = TRUE)
-  roc_full <- pROC::roc(response = analysis_data[[outcome_var]], predictor = prob_full, quiet = TRUE)
-
-  auc_base <- as.numeric(pROC::auc(roc_base))
-  auc_full <- as.numeric(pROC::auc(roc_full))
-  auc_diff <- auc_full - auc_base
-
-  # Nagelkerke R²
-  nag_base <- unname(DescTools::PseudoR2(model_reduced, which = "Nagelkerke"))
-  nag_full <- unname(DescTools::PseudoR2(model_full, which = "Nagelkerke"))
-  nag_diff <- nag_full - nag_base
-
-  # PRS effect per SD
-  prs_row   <- coef(summary(model_full))["PRS_SD", ]
-  log_or    <- unname(prs_row["Estimate"])
-  se_log_or <- unname(prs_row["Std. Error"])
-  p_value   <- unname(prs_row["Pr(>|z|)"])
-
-  or_per_sd <- exp(log_or)
-  or_ci     <- exp(c(log_or - 1.96 * se_log_or, log_or + 1.96 * se_log_or))
-  odds_increase_pct <- (or_per_sd - 1) * 100
-
-  logistic_txt <- glue("
-Base model AUC:               {round(auc_base, 4)}
-Full model AUC:               {round(auc_full, 4)}
-Delta AUC (PRS):              {round(auc_diff, 4)}
-
-Base model Nagelkerke R²:     {round(nag_base, 4)}
-Full model Nagelkerke R²:     {round(nag_full, 4)}
-Delta Nagelkerke R² (PRS):    {round(nag_diff, 4)}
-
-PRS effect per SD:
-  Log-odds beta:              {round(log_or, 4)}
-  OR per SD:                  {round(or_per_sd, 4)}
-  95% CI for OR:              [{round(or_ci[1], 4)}, {round(or_ci[2], 4)}]
-  % increase in odds / SD:    {round(odds_increase_pct, 2)}%
-  P-value:                    {signif(p_value, 4)}
-")
-
-  cat(logistic_txt, "\n")
-  print(summary(model_full))
-
-  results <- list(
-    trait_type         = trait_type,
-    n                  = nrow(analysis_data),
-    base_model         = model_reduced,
-    full_model         = model_full,
-    auc_base           = auc_base,
-    auc_full           = auc_full,
-    auc_diff           = auc_diff,
-    nagelkerke_base    = nag_base,
-    nagelkerke_full    = nag_full,
-    nagelkerke_diff    = nag_diff,
-    log_or_per_sd      = log_or,
-    or_per_sd          = or_per_sd,
-    or_ci_low          = or_ci[1],
-    or_ci_high         = or_ci[2],
-    odds_increase_pct  = odds_increase_pct,
-    p_value            = p_value
-  )
-
-}
+data <- data[
+  complete.cases(data),
+]
 ```
-
-

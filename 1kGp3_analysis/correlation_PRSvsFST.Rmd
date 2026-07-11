@@ -1,78 +1,424 @@
 ---
-title: "PRSvsFST"
-output: html_document
-date: "2025-04-17"
+title: "Compare Population FST with PRS Differences"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
 ```
 
-```{r}
+# Overview
+
+This notebook compares pairwise genetic differentiation between populations,
+measured with Hudson's \(F_{ST}\), with pairwise differences in mean polygenic
+risk scores.
+
+For every population pair, it:
+
+1. calculates the mean PRS in each population;
+2. calculates the absolute difference between the two population means;
+3. joins this value to the corresponding pairwise \(F_{ST}\);
+4. tests the correlation between \(F_{ST}\) and the PRS difference;
+5. creates a scatter plot with a linear regression line.
+
+# Required input
+
+## 1. Population-level FST summary
+
+Use the file created by `1kGp3_FST_combined.Rmd`:
+
+```text
+population_pairwise_fst.tsv
+```
+
+It must contain:
+
+```text
+POP1
+POP2
+HUDSON_FST
+```
+
+Each row represents one pair of 1000 Genomes populations.
+
+## 2. Individual PRS file
+
+A PLINK 2 `.sscore` file or tab-separated file containing one row per sample.
+
+It must contain:
+
+```text
+IID
+Population
+SCORE1_SUM
+```
+
+- `IID` is the sample identifier.
+- `Population` is the 1000 Genomes population code.
+- `SCORE1_SUM` is the individual polygenic score.
+
+If the population column is not already present in the score file, add it by
+joining the score file to the 1000 Genomes `.psam` file before running this
+notebook.
+
+The score must be calculated for the same 1000 Genomes samples represented in
+the FST analysis.
+
+# 1. Load packages
+
+```{r packages}
+library(readr)
 library(dplyr)
 library(tidyr)
-library(glue)
 library(ggplot2)
+library(glue)
 ```
 
-```{r}
+# 2. Set paths
+
+Change only the settings in this section.
+
+```{r settings}
+# Main project directory
+path_prefix <- "path/to/project"
+
+# Trait or score label used in output filenames and plot titles
 trait <- "BMI"
+
+# Individual PRS file
+prs_file <- file.path(
+  path_prefix,
+  "1kGp3_PRS",
+  paste0(
+    trait,
+    "_PRS_output.sscore"
+  )
+)
+
+# Population pairwise FST file created by the FST notebook
+fst_file <- file.path(
+  path_prefix,
+  "1kGp3_FST",
+  "population_pairwise_fst.tsv"
+)
+
+# Output directory
+output_dir <- file.path(
+  path_prefix,
+  "1kGp3_FST",
+  "PRS_comparison"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
 ```
 
-```{r}
-prs <- read_table(glue("R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_PRS/{trait}_PRS_output.sscore"))
+# 3. Read and validate the PRS data
 
+```{r read-prs}
+prs <- read_tsv(
+  prs_file,
+  show_col_types = FALSE
+)
+
+required_prs_columns <- c(
+  "IID",
+  "Population",
+  "SCORE1_SUM"
+)
+
+missing_prs_columns <- setdiff(
+  required_prs_columns,
+  names(prs)
+)
+
+if (length(missing_prs_columns) > 0) {
+  stop(
+    "The PRS file is missing these columns: ",
+    paste(
+      missing_prs_columns,
+      collapse = ", "
+    )
+  )
+}
+
+prs <- prs %>%
+  filter(
+    !is.na(Population),
+    !is.na(SCORE1_SUM)
+  )
+```
+
+# 4. Calculate the mean PRS per population
+
+```{r population-means}
 prs_means <- prs %>%
   group_by(Population) %>%
-  summarise(mean_prs = mean(SCORE1_SUM), .groups = "drop")
+  summarise(
+    n_samples = n(),
+    mean_prs = mean(
+      SCORE1_SUM,
+      na.rm = TRUE
+    ),
+    sd_prs = sd(
+      SCORE1_SUM,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  )
+
+write_tsv(
+  prs_means,
+  file.path(
+    output_dir,
+    paste0(
+      trait,
+      "_population_prs_summary.tsv"
+    )
+  )
+)
+
+prs_means
 ```
 
-#Calculate pairwise difference of PRS between populations
+# 5. Calculate pairwise PRS differences
 
-```{r}
-prs_diff <- prs_means %>%
-  rename(Pop1 = Population, mean1 = mean_prs) %>%
-  crossing(rename(prs_means, Pop2 = Population, mean2 = mean_prs)) %>%
-  filter(Pop1 < Pop2) %>%  # avoid duplicates like A–B and B–A
-  mutate(PRS_diff = abs(mean1 - mean2))
+Only one row is retained for each unordered population pair.
+
+```{r pairwise-prs-differences}
+prs_differences <- prs_means %>%
+  select(
+    Population,
+    mean_prs
+  ) %>%
+  rename(
+    POP1 = Population,
+    mean_prs_1 = mean_prs
+  ) %>%
+  crossing(
+    prs_means %>%
+      select(
+        Population,
+        mean_prs
+      ) %>%
+      rename(
+        POP2 = Population,
+        mean_prs_2 = mean_prs
+      )
+  ) %>%
+  filter(
+    POP1 < POP2
+  ) %>%
+  mutate(
+    PRS_difference = abs(
+      mean_prs_1 -
+        mean_prs_2
+    )
+  )
 ```
 
-```{r}
-print(prs_diff)
+# 6. Read and standardize the FST data
+
+The population names are sorted within every pair so that the join is
+independent of whether PLINK wrote a pair as `POP1–POP2` or `POP2–POP1`.
+
+```{r read-fst}
+fst <- read_tsv(
+  fst_file,
+  show_col_types = FALSE
+)
+
+names(fst) <- sub(
+  "^#",
+  "",
+  names(fst)
+)
+
+names(fst) <- sub(
+  "^X\\.",
+  "",
+  names(fst)
+)
+
+required_fst_columns <- c(
+  "POP1",
+  "POP2",
+  "HUDSON_FST"
+)
+
+missing_fst_columns <- setdiff(
+  required_fst_columns,
+  names(fst)
+)
+
+if (length(missing_fst_columns) > 0) {
+  stop(
+    "The FST file is missing these columns: ",
+    paste(
+      missing_fst_columns,
+      collapse = ", "
+    )
+  )
+}
+
+fst <- fst %>%
+  transmute(
+    POP1_original = POP1,
+    POP2_original = POP2,
+    POP1 = pmin(
+      POP1_original,
+      POP2_original
+    ),
+    POP2 = pmax(
+      POP1_original,
+      POP2_original
+    ),
+    HUDSON_FST = as.numeric(
+      HUDSON_FST
+    )
+  ) %>%
+  filter(
+    !is.na(HUDSON_FST)
+  )
 ```
 
-#Join PRS and FST data
+# 7. Join FST and PRS differences
 
-```{r}
-# Set the path to your files
-fst_file <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations.fst.summary"
+```{r join-data}
+combined <- prs_differences %>%
+  left_join(
+    fst,
+    by = c(
+      "POP1",
+      "POP2"
+    )
+  ) %>%
+  filter(
+    !is.na(HUDSON_FST),
+    !is.na(PRS_difference)
+  )
+
+write_tsv(
+  combined,
+  file.path(
+    output_dir,
+    paste0(
+      trait,
+      "_population_FST_vs_PRS.tsv"
+    )
+  )
+)
+
+cat(
+  "Population pairs with both FST and PRS data:",
+  nrow(combined),
+  "\n"
+)
 ```
 
-```{r}
-# Read the FST summary
-fst_data <- read.delim(fst_file, header = TRUE, sep = "\t", comment.char = "")
-colnames(fst_data)[colnames(fst_data) == "X.POP1"] <- "Pop1"
-colnames(fst_data)[colnames(fst_data) == "POP2"] <- "Pop2"
+# 8. Correlation test
+
+Pearson correlation is used to test the linear association. Spearman
+correlation is also reported as a rank-based comparison.
+
+```{r correlation-tests}
+pearson_test <- cor.test(
+  combined$HUDSON_FST,
+  combined$PRS_difference,
+  method = "pearson"
+)
+
+spearman_test <- cor.test(
+  combined$HUDSON_FST,
+  combined$PRS_difference,
+  method = "spearman",
+  exact = FALSE
+)
+
+correlation_results <- tibble(
+  method = c(
+    "Pearson",
+    "Spearman"
+  ),
+  correlation = c(
+    unname(
+      pearson_test$estimate
+    ),
+    unname(
+      spearman_test$estimate
+    )
+  ),
+  p_value = c(
+    pearson_test$p.value,
+    spearman_test$p.value
+  ),
+  n_population_pairs = nrow(
+    combined
+  )
+)
+
+write_tsv(
+  correlation_results,
+  file.path(
+    output_dir,
+    paste0(
+      trait,
+      "_FST_PRS_correlation.tsv"
+    )
+  )
+)
+
+correlation_results
 ```
 
-```{r}
-combined <- left_join(prs_diff, fst_data, by = c("Pop1", "Pop2"))
-```
+# 9. Plot FST against PRS differences
 
-```{r}
-print(combined)
-```
-
-#Plot and test for correlation 
-```{r}
-ggplot(combined, aes(x = HUDSON_FST, y = PRS_diff)) +
+```{r plot}
+fst_prs_plot <- ggplot(
+  combined,
+  aes(
+    x = HUDSON_FST,
+    y = PRS_difference
+  )
+) +
   geom_point() +
-  geom_smooth(method = "lm", se = TRUE, color = "blue") +
-  labs(title = "PRS difference vs FST between populations",
-       x = "FST", y = "PRS difference") +
+  geom_smooth(
+    method = "lm",
+    se = TRUE
+  ) +
+  labs(
+    title = glue(
+      "{trait}: population PRS differences versus FST"
+    ),
+    x = "Pairwise Hudson FST",
+    y = "Absolute difference in mean PRS"
+  ) +
   theme_minimal()
-```
-```{r}
-cor.test(combined$HUDSON_FST, combined$PRS_diff)
-```
 
+fst_prs_plot
+
+ggsave(
+  filename = file.path(
+    output_dir,
+    paste0(
+      trait,
+      "_FST_vs_PRS.png"
+    )
+  ),
+  plot = fst_prs_plot,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+```

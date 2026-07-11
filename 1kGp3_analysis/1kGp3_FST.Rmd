@@ -1,133 +1,420 @@
 ---
-title: "1kGp3_FST"
-output: html_document
-date: "2025-04-16"
+title: "1000 Genomes FST Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+date: "`r Sys.Date()`"
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-# Load libraries
-```{r libraries}
-library(tidyverse)
-library(data.table)
-library(knitr)
-```
-```{r}
-plink2 <- "C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe" 
-analysis_dir <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST"
-basename <- "1kgALL_ph3_hg38_maf001_uniqueSNPIDs"
-base <- file.path(analysis_dir, basename)
-```
-
-```{r}
-psam <- fread(file.path(analysis_dir, paste0(basename, ".psam")))
-psam <- psam %>% rename(IID = `#IID`)
-```
-```{r}
-head(psam)
-nrow(psam)
-```
-```{r}
-pop_map <- psam %>%
-  select(IID, Population) %>%
-  mutate(FID = 0) %>%
-  select(FID, IID, Population)
-fwrite(pop_map, "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/population_mapping.txt", sep = "\t")
-```
-
-# pairwise FST using plink2
-```{r}
-system("C:/Users/mar5862fre/Downloads/plink2_win64_20250414/plink2.exe --pfile R:/Doktoranden/MarieFreudenberg/daten/1kG_ph3/1kgALL_ph3_hg38_maf001_uniqueSNPIDs --fst Population --out R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations")
-```
-
-#Plot heatmap of pairwise FST
-
-```{r}
-library(pheatmap)
-library(reshape2)
-```
-
-```{r}
-# Set the path to your files
-fst_file <- "R:/Doktoranden/MarieFreudenberg/analysen/1kGp3_FST/populations.fst.summary"
-```
-
-```{r}
-# Read the FST summary
-fst_data <- read.delim(fst_file, header = TRUE, sep = "\t", comment.char = "")
-colnames(fst_data)[colnames(fst_data) == "X.POP1"] <- "POP1"
-```
-
-```{r}
-# Inspect column names
-head(fst_data) 
-```
-```{r}
-pop_order <- c(
-  # AFR (African)
-  "ACB", "ASW", "ESN", "GWD", "LWK", "MSL", "YRI",
-  
-  # AMR (Admixed American)
-  "CLM", "MXL", "PEL", "PUR",
-  
-  # EAS (East Asian)
-  "CDX", "CHB", "CHS", "JPT", "KHV",
-  
-  # EUR (European)
-  "CEU", "FIN", "GBR", "IBS", "TSI",
-  
-  # SAS (South Asian)
-  "BEB", "GIH", "ITU", "PJL", "STU"
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
 )
 ```
 
+# Overview
 
-```{r}
-# Create an empty matrix
-fst_matrix <- matrix(NA, nrow = length(pop_order), ncol = length(pop_order))
-rownames(fst_matrix) <- pop_order
-colnames(fst_matrix) <- pop_order
-```
-```{r}
-print(pop_order)
+This notebook calculates Hudson's pairwise \(F_{ST}\) for the 1000 Genomes
+Phase 3 dataset between individual populations and between superpopulations.
+
+
+# Required input
+
+## PLINK 2 genotype dataset
+
+A PLINK 2 dataset with one shared file prefix:
+
+```text
+path/to/1kg_phase3.pgen
+path/to/1kg_phase3.pvar
+path/to/1kg_phase3.psam
 ```
 
-```{r}
-# Fill matrix with FST values
-for (i in 1:nrow(fst_data)) {
-  p1 <- fst_data$POP1[i]
-  p2 <- fst_data$POP2[i]
-  fst <- fst_data$HUDSON_FST[i]
-  fst_matrix[p1, p2] <- fst
-  fst_matrix[p2, p1] <- fst  # symmetric
+The `.psam` file must contain these columns:
+
+```text
+#IID
+Population
+SuperPop
+```
+
+Each sample must have a population code such as `CEU`, `YRI`, or `CHB`, and a
+superpopulation code such as `EUR`, `AFR`, or `EAS`.
+
+The genotype dataset should already contain the variants intended for the FST
+analysis, including any desired quality-control and MAF filters.
+
+## Software
+
+PLINK 2 is required:
+
+<https://www.cog-genomics.org/plink/2.0/>
+
+# 1. Load packages
+
+```{r packages}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(pheatmap)
+```
+
+# 2. Set paths
+
+```{r settings}
+# Main project directory
+path_prefix <- "path/to/project"
+
+# PLINK 2 executable
+plink2_path <- "path/to/plink2.exe"
+
+# PLINK 2 genotype prefix without .pgen, .pvar, or .psam
+genotype_prefix <- file.path(
+  path_prefix,
+  "path",
+  "to",
+  "1kg_phase3"
+)
+
+# Output directory
+output_dir <- file.path(
+  path_prefix,
+  "1kGp3_FST"
+)
+
+dir.create(
+  output_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+```
+
+# 3. Read sample information
+
+```{r sample-information}
+psam <- fread(
+  paste0(genotype_prefix, ".psam")
+)
+
+if ("#IID" %in% names(psam)) {
+  setnames(psam, "#IID", "IID")
+}
+
+required_columns <- c(
+  "IID",
+  "Population",
+  "SuperPop"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  names(psam)
+)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "The .psam file is missing these columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+psam <- psam %>%
+  filter(
+    !is.na(IID),
+    !is.na(Population),
+    !is.na(SuperPop)
+  )
+
+populations <- sort(
+  unique(psam$Population)
+)
+
+superpopulations <- sort(
+  unique(psam$SuperPop)
+)
+
+cat(
+  "Samples:",
+  nrow(psam),
+  "\nPopulations:",
+  length(populations),
+  "\nSuperpopulations:",
+  length(superpopulations),
+  "\n"
+)
+```
+
+# 4. Helper functions
+
+```{r helper-functions}
+run_plink <- function(arguments) {
+
+  command <- paste(
+    shQuote(plink2_path),
+    arguments
+  )
+
+  cat("Running:\n", command, "\n\n")
+
+  status <- system(command)
+
+  if (status != 0) {
+    stop(
+      "PLINK 2 returned a non-zero exit status."
+    )
+  }
+}
+
+read_fst_summary <- function(path) {
+
+  fst <- fread(path)
+
+  names(fst) <- sub(
+    "^#",
+    "",
+    names(fst)
+  )
+
+  names(fst) <- sub(
+    "^X\\.",
+    "",
+    names(fst)
+  )
+
+  fst
+}
+
+fst_to_matrix <- function(
+    fst_data,
+    group_order
+) {
+
+  fst_matrix <- matrix(
+    NA_real_,
+    nrow = length(group_order),
+    ncol = length(group_order),
+    dimnames = list(
+      group_order,
+      group_order
+    )
+  )
+
+  for (i in seq_len(nrow(fst_data))) {
+
+    group1 <- fst_data$POP1[i]
+    group2 <- fst_data$POP2[i]
+
+    if (
+      group1 %in% group_order &&
+        group2 %in% group_order
+    ) {
+      fst_matrix[group1, group2] <-
+        fst_data$HUDSON_FST[i]
+
+      fst_matrix[group2, group1] <-
+        fst_data$HUDSON_FST[i]
+    }
+  }
+
+  diag(fst_matrix) <- NA_real_
+
+  fst_matrix
 }
 ```
 
-```{r}
-# Set diagonal to 0 (or NA if you prefer)
-diag(fst_matrix) <- NA
+# 5. Pairwise FST between populations
+
+PLINK 2 reads the `Population` column directly from the `.psam` file.
+
+```{r population-fst}
+population_prefix <- file.path(
+  output_dir,
+  "populations"
+)
+
+run_plink(
+  paste(
+    "--pfile",
+    shQuote(genotype_prefix),
+    "--fst Population",
+    "--out",
+    shQuote(population_prefix)
+  )
+)
+
+population_fst <- read_fst_summary(
+  paste0(
+    population_prefix,
+    ".fst.summary"
+  )
+)
+
+fwrite(
+  population_fst,
+  file.path(
+    output_dir,
+    "population_pairwise_fst.tsv"
+  ),
+  sep = "\t"
+)
 ```
 
-```{r}
-print(fst_matrix)
+# 6. Population FST heatmap
+
+The population order below groups populations by superpopulation.
+
+```{r population-order}
+population_order <- c(
+  "ACB", "ASW", "ESN", "GWD", "LWK", "MSL", "YRI",
+  "CLM", "MXL", "PEL", "PUR",
+  "CDX", "CHB", "CHS", "JPT", "KHV",
+  "CEU", "FIN", "GBR", "IBS", "TSI",
+  "BEB", "GIH", "ITU", "PJL", "STU"
+)
+
+population_order <- population_order[
+  population_order %in% populations
+]
+
+additional_populations <- setdiff(
+  populations,
+  population_order
+)
+
+population_order <- c(
+  population_order,
+  additional_populations
+)
+
+population_fst_matrix <- fst_to_matrix(
+  population_fst,
+  population_order
+)
 ```
 
+```{r population-heatmap}
+pheatmap(
+  population_fst_matrix,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.3f",
+  main = "Pairwise Hudson FST between populations",
+  fontsize_row = 8,
+  fontsize_col = 8,
+  filename = file.path(
+    output_dir,
+    "population_pairwise_fst_heatmap.png"
+  ),
+  width = 10,
+  height = 9
+)
 
-```{r}
-# Plot the heatmap
-pheatmap(fst_matrix,
-         clustering_distance_rows = "euclidean",
-         clustering_distance_cols = "euclidean",
-         cluster_rows = FALSE,
-         cluster_cols = FALSE,
-         display_numbers = TRUE,
-         main = "Pairwise FST Heatmap",
-         fontsize_row = 10,
-         fontsize_col = 10)
+pheatmap(
+  population_fst_matrix,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.3f",
+  main = "Pairwise Hudson FST between populations",
+  fontsize_row = 8,
+  fontsize_col = 8
+)
 ```
 
+# 7. Pairwise FST between superpopulations
 
+PLINK 2 reads the `SuperPop` column directly from the `.psam` file.
 
+```{r superpopulation-fst}
+superpopulation_prefix <- file.path(
+  output_dir,
+  "superpopulations"
+)
 
+run_plink(
+  paste(
+    "--pfile",
+    shQuote(genotype_prefix),
+    "--fst SuperPop",
+    "--out",
+    shQuote(superpopulation_prefix)
+  )
+)
+
+superpopulation_fst <- read_fst_summary(
+  paste0(
+    superpopulation_prefix,
+    ".fst.summary"
+  )
+)
+
+fwrite(
+  superpopulation_fst,
+  file.path(
+    output_dir,
+    "superpopulation_pairwise_fst.tsv"
+  ),
+  sep = "\t"
+)
+```
+
+# 8. Superpopulation FST heatmap
+
+```{r superpopulation-heatmap}
+superpopulation_order <- c(
+  "AFR",
+  "AMR",
+  "EAS",
+  "EUR",
+  "SAS"
+)
+
+superpopulation_order <-
+  superpopulation_order[
+    superpopulation_order %in%
+      superpopulations
+  ]
+
+additional_superpopulations <- setdiff(
+  superpopulations,
+  superpopulation_order
+)
+
+superpopulation_order <- c(
+  superpopulation_order,
+  additional_superpopulations
+)
+
+superpopulation_fst_matrix <- fst_to_matrix(
+  superpopulation_fst,
+  superpopulation_order
+)
+
+pheatmap(
+  superpopulation_fst_matrix,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.3f",
+  main = "Pairwise Hudson FST between superpopulations",
+  filename = file.path(
+    output_dir,
+    "superpopulation_pairwise_fst_heatmap.png"
+  ),
+  width = 7,
+  height = 6
+)
+
+pheatmap(
+  superpopulation_fst_matrix,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  number_format = "%.3f",
+  main = "Pairwise Hudson FST between superpopulations"
+)
+```

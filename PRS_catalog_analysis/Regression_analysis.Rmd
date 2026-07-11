@@ -1,0 +1,524 @@
+---
+title: "PRS Regression Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+# Overview
+
+This notebook evaluates the association between a standardized polygenic risk
+score and a phenotype.
+
+Set `outcome_type` to:
+
+- `"continuous"` to run the original linear-regression workflow;
+- `"binary"` to run the original logistic-regression workflow.
+
+## Required files
+
+- A phenotype and covariate file containing:
+  `IID`, `Phenotype`, `Age`, `Sex`, and `PC1` to `PC10`.
+- A standardized PRS file containing:
+  `IID` and `SCORE_standardized`.
+
+# 1. Load packages
+
+```{r packages}
+library(readr)
+library(dplyr)
+library(glue)
+library(ggplot2)
+library(tibble)
+library(knitr)
+library(pROC)
+```
+
+# 2. Analysis settings
+
+Change only the settings in this section.
+
+```{r settings}
+# Main project path
+path_prefix <- "path/to/project"
+
+# Trait and PGS identifier
+trait <- "Height"
+pgs_file <- "PGS002804"
+
+# Type of phenotype:
+# "continuous" for linear regression
+# "binary" for logistic regression
+outcome_type <- "continuous"
+
+phenotype_file <- file.path(
+  path_prefix,
+  "Phenofiles",
+  paste0(trait, "_covars.tsv")
+)
+
+prs_file <- file.path(
+  path_prefix,
+  "LIFE_PRS",
+  paste0(pgs_file, "_output_standardized.tsv")
+)
+
+score_col <- "SCORE_standardized"
+
+covariates <- c(
+  "Age",
+  "Sex",
+  paste0("PC", 1:10)
+)
+```
+
+# 3. Load and merge data
+
+```{r load-data}
+phenotype_data <- read_tsv(
+  phenotype_file,
+  show_col_types = FALSE
+)
+
+prs_data <- read_tsv(
+  prs_file,
+  show_col_types = FALSE
+)
+
+data <- phenotype_data %>%
+  left_join(prs_data, by = "IID")
+```
+
+# 4. Prepare analysis data
+
+```{r prepare-data}
+model_variables <- c(
+  "IID",
+  "Phenotype",
+  score_col,
+  covariates
+)
+
+data_model <- data %>%
+  select(all_of(model_variables)) %>%
+  filter(complete.cases(.)) %>%
+  mutate(Sex = as.factor(Sex))
+
+if (outcome_type == "binary") {
+  data_model <- data_model %>%
+    filter(Phenotype %in% c(0, 1)) %>%
+    mutate(Phenotype = as.integer(Phenotype))
+}
+```
+
+# 5. Define model formulas
+
+```{r formulas}
+base_formula <- as.formula(
+  paste(
+    "Phenotype ~",
+    paste(covariates, collapse = " + ")
+  )
+)
+
+full_formula <- as.formula(
+  paste(
+    "Phenotype ~",
+    paste(c(score_col, covariates), collapse = " + ")
+  )
+)
+```
+
+# 6. Linear regression
+
+```{r linear-regression}
+if (outcome_type == "continuous") {
+
+  model_reduced <- lm(
+    base_formula,
+    data = data_model
+  )
+
+  model <- lm(
+    full_formula,
+    data = data_model
+  )
+
+  r2_full <- summary(model)$r.squared
+  r2_covars <- summary(model_reduced)$r.squared
+  r2_prs <- r2_full - r2_covars
+
+  var_explained_txt <- glue(
+    "
+Base model R²:                {round(r2_covars, 4)}
+Full model R²:                {round(r2_full, 4)}
+Incremental R²:               {round(r2_prs, 4)}
+"
+  )
+
+  cat(var_explained_txt, "\n")
+}
+```
+
+## PRS effect per standard deviation
+
+```{r linear-effect}
+if (outcome_type == "continuous") {
+
+  coef_table <- summary(model)$coefficients
+
+  beta_per_sd <- coef_table[
+    score_col,
+    "Estimate"
+  ]
+
+  se_per_sd <- coef_table[
+    score_col,
+    "Std. Error"
+  ]
+
+  p_value <- coef_table[
+    score_col,
+    "Pr(>|t|)"
+  ]
+
+  ci_per_sd <- confint(
+    model,
+    score_col,
+    level = 0.95
+  )
+
+  beta_txt <- glue(
+    "
+PRS effect per SD:
+  Beta per SD:                 {round(beta_per_sd, 4)} {phenotype_unit}
+  95% CI:                      [{round(ci_per_sd[1], 4)}, {round(ci_per_sd[2], 4)}] {phenotype_unit}
+  Standard error:              {round(se_per_sd, 4)}
+  P-value:                     {format.pval(p_value, digits = 4, eps = 1e-300)}
+"
+  )
+
+  cat(beta_txt, "\n")
+}
+```
+
+## Predicted phenotype
+
+```{r linear-prediction}
+if (outcome_type == "continuous") {
+
+  phenotype_mean <- mean(
+    data_model$Phenotype,
+    na.rm = TRUE
+  )
+
+  effect_size <- coef(model)[score_col]
+
+  data_model <- data_model %>%
+    mutate(
+      predicted = phenotype_mean +
+        .data[[score_col]] * effect_size,
+      predicted_full = predict(
+        model,
+        newdata = data_model
+      )
+    )
+}
+```
+
+## Predicted versus measured phenotype
+
+```{r linear-predicted-plot}
+if (outcome_type == "continuous") {
+
+  ggplot(
+    data_model,
+    aes(
+      x = predicted_full,
+      y = Phenotype
+    )
+  ) +
+    geom_point(
+      alpha = 0.4,
+      color = "steelblue"
+    ) +
+    geom_smooth(
+      method = "lm",
+      color = "darkred"
+    ) +
+    labs(
+      title = glue(
+        "Predicted vs Measured {trait}"
+      ),
+      x = "Predicted Phenotype",
+      y = "Measured Phenotype"
+    ) +
+    theme_minimal()
+}
+```
+
+## PRS effect on phenotype
+
+```{r linear-prs-plot}
+if (outcome_type == "continuous") {
+
+  ggplot(
+    data_model,
+    aes(
+      x = .data[[score_col]],
+      y = Phenotype
+    )
+  ) +
+    geom_point(alpha = 0.3) +
+    geom_smooth(
+      method = "lm",
+      formula = y ~ x,
+      color = "blue"
+    ) +
+    labs(
+      title = glue(
+        "Effect of {trait} PRS on Phenotype"
+      ),
+      x = "Standardized PRS",
+      y = "Phenotype"
+    ) +
+    theme_minimal()
+}
+```
+
+# 6. Logistic regression
+
+This section runs only when:
+
+```r
+outcome_type <- "binary"
+```
+
+## Fit logistic regression models
+
+```{r logistic-models}
+if (outcome_type == "binary") {
+
+  m_null <- glm(
+    Phenotype ~ 1,
+    data = data_model,
+    family = binomial()
+  )
+
+  m_base <- glm(
+    base_formula,
+    data = data_model,
+    family = binomial()
+  )
+
+  m_full <- glm(
+    full_formula,
+    data = data_model,
+    family = binomial()
+  )
+}
+```
+
+## PRS effect per standard deviation
+
+Because the PRS is standardized, the odds ratio represents the increase in odds
+per one-standard-deviation higher PRS.
+
+```{r logistic-effect}
+if (outcome_type == "binary") {
+
+  prs_coef <- summary(m_full)$coefficients[
+    score_col,
+  ]
+
+  prs_beta <- prs_coef["Estimate"]
+  prs_se <- prs_coef["Std. Error"]
+  prs_p <- prs_coef["Pr(>|z|)"]
+
+  prs_or <- exp(prs_beta)
+
+  prs_or_ci_low <- exp(
+    prs_beta - 1.96 * prs_se
+  )
+
+  prs_or_ci_high <- exp(
+    prs_beta + 1.96 * prs_se
+  )
+
+  prs_effect_table <- tibble(
+    term = score_col,
+    beta = prs_beta,
+    SE = prs_se,
+    OR_per_SD = prs_or,
+    CI_low = prs_or_ci_low,
+    CI_high = prs_or_ci_high,
+    p_value = prs_p
+  )
+
+  kable(
+    prs_effect_table,
+    digits = 4
+  )
+}
+```
+
+## AUC comparison
+
+```{r logistic-auc}
+if (outcome_type == "binary") {
+
+  p_base <- predict(
+    m_base,
+    type = "response"
+  )
+
+  p_full <- predict(
+    m_full,
+    type = "response"
+  )
+
+  roc_base <- roc(
+    data_model$Phenotype,
+    p_base,
+    quiet = TRUE
+  )
+
+  roc_full <- roc(
+    data_model$Phenotype,
+    p_full,
+    quiet = TRUE
+  )
+
+  auc_base <- as.numeric(
+    auc(roc_base)
+  )
+
+  auc_full <- as.numeric(
+    auc(roc_full)
+  )
+
+  delta_auc <- auc_full - auc_base
+
+  ci_auc_base <- ci.auc(roc_base)
+  ci_auc_full <- ci.auc(roc_full)
+
+  auc_test <- roc.test(
+    roc_base,
+    roc_full,
+    paired = TRUE,
+    method = "delong"
+  )
+
+  auc_results <- tibble(
+    model = c(
+      "Base",
+      "Full: Base + PRS",
+      "Difference"
+    ),
+    AUC = c(
+      auc_base,
+      auc_full,
+      delta_auc
+    ),
+    CI_low = c(
+      ci_auc_base[1],
+      ci_auc_full[1],
+      NA
+    ),
+    CI_high = c(
+      ci_auc_base[3],
+      ci_auc_full[3],
+      NA
+    ),
+    p_value_DeLong = c(
+      NA,
+      NA,
+      auc_test$p.value
+    )
+  )
+
+  kable(
+    auc_results,
+    digits = 4
+  )
+}
+```
+
+## ROC plot
+
+```{r logistic-roc-plot}
+if (outcome_type == "binary") {
+
+  plot(
+    roc_base,
+    col = "black",
+    lwd = 2,
+    main = glue(
+      "ROC Curve: {trait}"
+    )
+  )
+
+  plot(
+    roc_full,
+    col = "blue",
+    lwd = 2,
+    add = TRUE
+  )
+
+  legend(
+    "bottomright",
+    legend = c(
+      paste0(
+        "Base model = ",
+        round(auc_base, 3)
+      ),
+      paste0(
+        "Full model = ",
+        round(auc_full, 3)
+      )
+    ),
+    col = c("black", "blue"),
+    lwd = 2
+  )
+}
+```
+
+## PRS distribution by phenotype
+
+```{r logistic-boxplot}
+if (outcome_type == "binary") {
+
+  ggplot(
+    data_model,
+    aes(
+      x = factor(Phenotype),
+      y = .data[[score_col]]
+    )
+  ) +
+    geom_boxplot(outlier.alpha = 0.3) +
+    geom_jitter(
+      width = 0.15,
+      alpha = 0.2
+    ) +
+    labs(
+      title = glue(
+        "{trait} PRS by phenotype status"
+      ),
+      x = "Phenotype",
+      y = "Standardized PRS"
+    ) +
+    theme_minimal()
+}
+```
+
